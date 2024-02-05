@@ -8808,7 +8808,8 @@ static void quantize_row_q8_1_sycl(const float *x, void *vy, const int kx,
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_sycl(const void *__restrict__ vx,
                                   dst_t *__restrict__ y, const int k,
-                                  dpct::queue_ptr stream) {
+                                  dpct::queue_ptr stream) try {
+    stream->wait();
     const int num_blocks = (k + SYCL_DEQUANTIZE_BLOCK_SIZE - 1) / SYCL_DEQUANTIZE_BLOCK_SIZE;
     {
         dpct::has_capability_or_fail(stream->get_device(),
@@ -8823,6 +8824,11 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
                 dequantize_block<qk, qr, dequantize_kernel>(vx, y, k, item_ct1);
             });
     }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 template <typename dst_t>
@@ -11985,6 +11991,7 @@ inline void ggml_sycl_op_mul_mat_q(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
+    std::cout << "ggml_sycl_op_mul_mat_q\n";
 
     const int64_t ne00 = src0->ne[0];
 
@@ -12092,6 +12099,7 @@ inline void ggml_sycl_op_mul_mat_vec_q(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
+    std::cout << "ggml_sycl_op_mul_mat_vec_q\n";
 
     GGML_ASSERT(ggml_nrows(src1) == 1);
 
@@ -12147,9 +12155,12 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
+    std::cout << "ggml_sycl_op_deqantize_mul_mat_vec\n";
 
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_SYCL_F16
@@ -12177,36 +12188,47 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
+            std::cout << "dequantize_mul_mat_vec_q4_0_sycl\n";
             dequantize_mul_mat_vec_q4_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q4_1:
+            std::cout << "dequantize_mul_mat_vec_q4_1_sycl\n";
             dequantize_mul_mat_vec_q4_1_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_0:
+            std::cout << "dequantize_mul_mat_vec_q5_0_sycl\n";
             dequantize_mul_mat_vec_q5_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_1:
+            std::cout << "dequantize_mul_mat_vec_q5_1_sycl\n";
             dequantize_mul_mat_vec_q5_1_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q8_0:
+            std::cout << "dequantize_mul_mat_vec_q8_0_sycl\n";
             dequantize_mul_mat_vec_q8_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q2_K:
+            std::cout << "dequantize_mul_mat_vec_q2_K_sycl\n";
             dequantize_mul_mat_vec_q2_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q3_K:
+            std::cout << "dequantize_mul_mat_vec_q3_K_sycl\n";
             dequantize_mul_mat_vec_q3_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q4_K:
+            std::cout << "dequantize_mul_mat_vec_q4_K_sycl\n";
             dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_K:
+            std::cout << "dequantize_mul_mat_vec_q5_K_sycl\n";
             dequantize_mul_mat_vec_q5_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q6_K:
+            std::cout << "dequantize_mul_mat_vec_q6_K_sycl\n";
             dequantize_mul_mat_vec_q6_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_F16:
+            std::cout << "convert_mul_mat_vec_f16_sycl\n";
             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         default:
@@ -12227,6 +12249,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
+    std::cout << "ggml_sycl_op_mul_mat_sycl\n";
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -12305,6 +12328,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     else {
         // GGML_SYCL_DEBUG("ggml_sycl_op_mul_mat_sycl - fp32 path\n");
         sycl_pool_alloc<float> src0_ddq_as_f32;
+        sycl_pool_alloc<float> src1_ddq_as_f32;
 
         if (src0->type != GGML_TYPE_F32) {
             const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src0->type);
@@ -12312,17 +12336,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
             src0_ddq_as_f32.alloc(row_diff*ne00);
             to_fp32_sycl(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
         }
+                if (src1->type != GGML_TYPE_F32) {
+            const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src1->type);
+            GGML_ASSERT(to_fp32_sycl != nullptr);
+            src1_ddq_as_f32.alloc(src1_ncols*ne10);
+            to_fp32_sycl(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+        }
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
+        const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
         const float alpha = 1.0f;
         const float beta = 0.0f;
+
 
         SYCL_CHECK(CHECK_TRY_ERROR(g_sycl_handles[id] = stream));
         SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
             *g_sycl_handles[id], oneapi::mkl::transpose::trans,
             oneapi::mkl::transpose::nontrans, row_diff, src1_ncols, ne10,
-            dpct::get_value(&alpha, *g_sycl_handles[id]), src0_ddf_i, ne00,
-            src1_ddf_i, ne10, dpct::get_value(&beta, *g_sycl_handles[id]),
+            alpha, src0_ddf_i, ne00,
+            src1_ddf1_i, ne10, beta,
             dst_dd_i, ldc)));
     }
 
@@ -12755,6 +12787,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                                  const ggml_tensor *src1, ggml_tensor *dst,
                                  ggml_sycl_op_mul_mat_t op,
                                  const bool convert_src1_to_q8_1) try {
+    std::cout << "ggml_sycl_op_mul_mat\n";
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -12777,8 +12810,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
 
     GGML_ASSERT(dst->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(src1->backend != GGML_BACKEND_GPU_SPLIT);
-
-    GGML_ASSERT(ne12 >= ne02 && ne12 % ne02 == 0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || ne12 >= ne02 && ne12 % ne02 == 0);
 
     const int64_t i02_divisor = ne12 / ne02;
 
@@ -13225,6 +13257,7 @@ bool ggml_sycl_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_te
 static void ggml_sycl_mul_mat_vec_p021(const ggml_tensor *src0,
                                        const ggml_tensor *src1,
                                        ggml_tensor *dst) try {
+    std::cout << "ggml_sycl_mul_mat_vec_p021\n";
     GGML_ASSERT(ggml_is_permuted(src0) && ggml_is_permuted(src1));
     GGML_ASSERT(src0->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(src0->nb[0] <= src0->nb[1] && src0->nb[2] <= src0->nb[3]); // 0213 permutation
@@ -13261,6 +13294,7 @@ catch (sycl::exception const &exc) {
 static void ggml_sycl_mul_mat_vec_nc(const ggml_tensor *src0,
                                      const ggml_tensor *src1,
                                      ggml_tensor *dst) try {
+    std::cout << "ggml_sycl_mul_mat_vec_nc\n";
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
     GGML_ASSERT(!ggml_is_permuted(src0));
@@ -13328,6 +13362,7 @@ static void k_compute_batched_ptrs(const sycl::half *src0_as_f16,
 static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
                                                  const ggml_tensor *src1,
                                                  ggml_tensor *dst) try {
+    std::cout << "ggml_sycl_mul_mat_batched_sycl\n";
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
 
@@ -13516,6 +13551,7 @@ catch (sycl::exception const &exc) {
 }
 
 static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    std::cout << "ggml_sycl_mul_mat\n";
     const bool all_on_device =
         (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         (src1->backend == GGML_BACKEND_GPU) &&
@@ -13561,7 +13597,7 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
         ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_sycl, false);
     } else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) {
         // GGML_SYCL_DEBUG("ggml_is_quantized or GGML_TYPE_F16\n");
-        if (src1->ne[1] == 1 && src0->ne[0] % GGML_SYCL_DMMV_X == 0) {
+        if (src1->ne[1] == 1 && src0->ne[0] % GGML_SYCL_DMMV_X == 0 && src1->type == GGML_TYPE_F32) {
 #ifdef GGML_SYCL_FORCE_DMMV
             const bool use_mul_mat_vec_q = false;
 #else
