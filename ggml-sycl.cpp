@@ -1688,8 +1688,8 @@ namespace dpct
         template <class Ta, class Tb, class Tc, class Ts>
         inline void gemm_impl(sycl::queue &q, oneapi::mkl::transpose a_trans,
                               oneapi::mkl::transpose b_trans, int m, int n, int k,
-                              const void *alpha, const void *a, int lda, const void *b,
-                              int ldb, const void *beta, void *c, int ldc)
+                              void *alpha, const void *a, int lda, const void *b,
+                              int ldb, void *beta, void *c, int ldc)
         {
 #ifndef __INTEL_MKL__
             GGML_UNUSED(q);
@@ -1750,58 +1750,69 @@ namespace dpct
         template <class Ta, class Tb, class Tc, class Ts>
         inline void gemm_batch_impl(sycl::queue &q, oneapi::mkl::transpose a_trans,
                                     oneapi::mkl::transpose b_trans, int m, int n, int k,
-                                    const void *alpha, const void **a, int lda,
-                                    const void **b, int ldb, const void *beta, void **c,
+                                    void *alpha, const void **a, int lda,
+                                    const void **b, int ldb, void *beta, void **c,
                                     int ldc, int batch_size)
         {
-            struct matrix_info_t
-            {
-                oneapi::mkl::transpose transpose_info[2];
-                Ts value_info[2];
-                std::int64_t size_info[3];
-                std::int64_t ld_info[3];
-                std::int64_t groupsize_info;
-            };
+            // TODO: fix issue where alpha could be a device pointer
 
-            Ts alpha_value = dpct::get_value(reinterpret_cast<const Ts *>(alpha), q);
-            Ts beta_value = dpct::get_value(reinterpret_cast<const Ts *>(beta), q);
+            // NOTE: could unify into single memory alloc if we wanted to improve performance
+            // structured a_trans, b_trans
+            oneapi::mkl::transpose *trans = reinterpret_cast<oneapi::mkl::transpose*>(std::malloc(sizeof(oneapi::mkl::transpose)*2*batch_size));
+            for (int batch = 0; batch < batch_size; ++batch) {
+                trans[batch + batch_size*0] = a_trans;
+                trans[batch + batch_size*1] = b_trans;
+            }
 
-            matrix_info_t *matrix_info =
-                (matrix_info_t *)std::malloc(sizeof(matrix_info_t));
-            matrix_info->transpose_info[0] = a_trans;
-            matrix_info->transpose_info[1] = b_trans;
-            matrix_info->value_info[0] = alpha_value;
-            matrix_info->value_info[1] = beta_value;
-            matrix_info->size_info[0] = m;
-            matrix_info->size_info[1] = n;
-            matrix_info->size_info[2] = k;
-            matrix_info->ld_info[0] = lda;
-            matrix_info->ld_info[1] = ldb;
-            matrix_info->ld_info[2] = ldc;
-            matrix_info->groupsize_info = batch_size;
+            // structured m, n, k, lda, ldb, ldc, group_size
+            int64_t *dims = reinterpret_cast<int64_t*>(std::malloc(sizeof(int64_t)*7*batch_size));
+            for (int batch = 0; batch < batch_size; ++batch) {
+                dims[batch + batch_size*0] = m;
+                dims[batch + batch_size*1] = n;
+                dims[batch + batch_size*2] = k;
+
+                dims[batch + batch_size*3] = lda;
+                dims[batch + batch_size*4] = ldb;
+                dims[batch + batch_size*5] = ldc;
+
+                dims[batch + batch_size*6] = 1; // all groups in batch are 1 matrix
+            }
+
+            // structured alpha, beta
+            Ts *coeff = reinterpret_cast<Ts*>(std::malloc(sizeof(Ts)*2*batch_size));
+            for (int batch = 0; batch < batch_size; ++batch) {
+                coeff[batch + batch_size*0] = *reinterpret_cast<Ts*>(alpha);
+                coeff[batch + batch_size*1] = *reinterpret_cast<Ts*>(beta);
+            }
 
             sycl::event e = oneapi::mkl::blas::column_major::gemm_batch(
-                q, matrix_info->transpose_info, matrix_info->transpose_info + 1,
-                matrix_info->size_info, matrix_info->size_info + 1,
-                matrix_info->size_info + 2, matrix_info->value_info,
-                reinterpret_cast<const Ta **>(a), matrix_info->ld_info,
-                reinterpret_cast<const Tb **>(b), matrix_info->ld_info + 1,
-                matrix_info->value_info + 1, reinterpret_cast<Tc **>(c),
-                matrix_info->ld_info + 2, 1, &(matrix_info->groupsize_info));
+                q, trans + batch_size*0/*a_trans*/, trans + batch_size*1/*b_trans*/,
+                dims + batch_size*0/*m*/, dims + batch_size*1/*n*/,
+                dims + batch_size*2/*k*/, coeff + batch_size*0/*alpha*/,
+                reinterpret_cast<const Ta **>(a), dims + batch_size*3/*lda*/,
+                reinterpret_cast<const Tb **>(b), dims + batch_size*4/*ldb*/,
+                coeff + batch_size*1/*beta*/, reinterpret_cast<Tc **>(c),
+                dims + batch_size*5/*ldc*/, batch_size, dims + batch_size*6/*group_size*/);
+            q.wait_and_throw();
 
             q.submit([&](sycl::handler &cgh)
-                     {
-    cgh.depends_on(e);
-    cgh.host_task([=] { std::free(matrix_info); }); });
+            {
+                  cgh.depends_on(e);
+                  cgh.host_task([=] {
+                      std::free(trans);
+                      std::free(dims);
+                      std::free(coeff);
+                  });
+            });
         }
 
         template <class Ta, class Tb, class Tc, class Ts>
         inline void
         gemm_batch_impl(sycl::queue &q, oneapi::mkl::transpose a_trans,
                         oneapi::mkl::transpose b_trans, int m, int n,
-                        int k, const void *alpha, const void *a, int lda,
+                        int k, void *alpha, const void *a, int lda,
                         long long int stride_a, const void *b, int ldb,
-                        long long int stride_b, const void *beta, void *c,
+                        long long int stride_b, void *beta, void *c,
                         int ldc, long long int stride_c, int batch_size)
         {
             Ts alpha_value = dpct::get_value(reinterpret_cast<const Ts *>(alpha), q);
@@ -2387,9 +2398,9 @@ namespace dpct
 
     inline void gemm(sycl::queue &q, oneapi::mkl::transpose a_trans,
                      oneapi::mkl::transpose b_trans, int m, int n, int k,
-                     const void *alpha, const void *a, library_data_t a_type,
+                     void *alpha, const void *a, library_data_t a_type,
                      int lda, const void *b, library_data_t b_type, int ldb,
-                     const void *beta, void *c, library_data_t c_type, int ldc,
+                     void *beta, void *c, library_data_t c_type, int ldc,
                      library_data_t scaling_type)
     {
         if (scaling_type == library_data_t::real_float &&
@@ -2538,9 +2549,9 @@ namespace dpct
     /// \param [in] scaling_type Data type of the scaling factors.
     inline void gemm_batch(sycl::queue &q, oneapi::mkl::transpose a_trans,
                            oneapi::mkl::transpose b_trans, int m, int n, int k,
-                           const void *alpha, const void *a[],
+                           void *alpha, const void *a[],
                            library_data_t a_type, int lda, const void *b[],
-                           library_data_t b_type, int ldb, const void *beta,
+                           library_data_t b_type, int ldb, void *beta,
                            void *c[], library_data_t c_type, int ldc,
                            int batch_size, library_data_t scaling_type)
     {
@@ -2709,10 +2720,10 @@ namespace dpct
     /// \param [in] scaling_type Data type of the scaling factors.
     inline void gemm_batch(sycl::queue &q, oneapi::mkl::transpose a_trans,
                            oneapi::mkl::transpose b_trans, int m, int n, int k,
-                           const void *alpha, const void *a, library_data_t a_type,
+                           void *alpha, const void *a, library_data_t a_type,
                            int lda, long long int stride_a, const void *b,
                            library_data_t b_type, int ldb, long long int stride_b,
-                           const void *beta, void *c, library_data_t c_type,
+                           void *beta, void *c, library_data_t c_type,
                            int ldc, long long int stride_c, int batch_size,
                            library_data_t scaling_type)
     {
@@ -11991,7 +12002,6 @@ inline void ggml_sycl_op_mul_mat_q(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
-    std::cout << "ggml_sycl_op_mul_mat_q\n";
 
     const int64_t ne00 = src0->ne[0];
 
@@ -12099,7 +12109,6 @@ inline void ggml_sycl_op_mul_mat_vec_q(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
-    std::cout << "ggml_sycl_op_mul_mat_vec_q\n";
 
     GGML_ASSERT(ggml_nrows(src1) == 1);
 
@@ -12155,7 +12164,6 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
-    std::cout << "ggml_sycl_op_deqantize_mul_mat_vec\n";
 
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
@@ -12188,47 +12196,36 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-            std::cout << "dequantize_mul_mat_vec_q4_0_sycl\n";
             dequantize_mul_mat_vec_q4_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q4_1:
-            std::cout << "dequantize_mul_mat_vec_q4_1_sycl\n";
             dequantize_mul_mat_vec_q4_1_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_0:
-            std::cout << "dequantize_mul_mat_vec_q5_0_sycl\n";
             dequantize_mul_mat_vec_q5_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_1:
-            std::cout << "dequantize_mul_mat_vec_q5_1_sycl\n";
             dequantize_mul_mat_vec_q5_1_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q8_0:
-            std::cout << "dequantize_mul_mat_vec_q8_0_sycl\n";
             dequantize_mul_mat_vec_q8_0_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q2_K:
-            std::cout << "dequantize_mul_mat_vec_q2_K_sycl\n";
             dequantize_mul_mat_vec_q2_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q3_K:
-            std::cout << "dequantize_mul_mat_vec_q3_K_sycl\n";
             dequantize_mul_mat_vec_q3_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q4_K:
-            std::cout << "dequantize_mul_mat_vec_q4_K_sycl\n";
             dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q5_K:
-            std::cout << "dequantize_mul_mat_vec_q5_K_sycl\n";
             dequantize_mul_mat_vec_q5_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_Q6_K:
-            std::cout << "dequantize_mul_mat_vec_q6_K_sycl\n";
             dequantize_mul_mat_vec_q6_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             break;
         case GGML_TYPE_F16:
-            std::cout << "convert_mul_mat_vec_f16_sycl\n";
             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         default:
@@ -12249,7 +12246,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
     float *dst_dd_i, const int64_t row_low, const int64_t row_high,
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) try {
-    std::cout << "ggml_sycl_op_mul_mat_sycl\n";
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -12310,8 +12306,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          : src1_as_f16.get();
         sycl_pool_alloc<sycl::half> dst_f16(row_diff * src1_ncols);
 
-        const sycl::half alpha_f16 = 1.0f;
-        const sycl::half beta_f16 = 0.0f;
+        sycl::half alpha_f16 = 1.0f;
+        sycl::half beta_f16 = 0.0f;
 
         SYCL_CHECK(CHECK_TRY_ERROR(g_sycl_handles[id] = stream));
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm(
@@ -12711,14 +12707,9 @@ static void ggml_sycl_op_flatten(const ggml_tensor *src0,
     }
 
     // GGML_SYCL_DEBUG("op src0=%p, src1=%p, dst=%p, src0_ddf=%p, src1_ddf=%p, dst_ddf=%p, main_stream=%p\n",
-        // src0, src1, dst, src0_ddf, src1_ddf, dst_ddf, main_stream);
+    //    src0, src1, dst, src0_ddf, src1_ddf, dst_ddf, main_stream);
     // do the computation
     op(src0, src1, dst, src0_ddf, src1_ddf, dst_ddf, main_stream);
-    /*
-    DPCT1010:89: SYCL uses exceptions to report errors and does not use the
-    error codes. The call was replaced with 0. You need to rewrite this code.
-    */
-    SYCL_CHECK(0);
 
     // copy dst to host if necessary
     if (!dst_on_device) {
@@ -12787,7 +12778,6 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                                  const ggml_tensor *src1, ggml_tensor *dst,
                                  ggml_sycl_op_mul_mat_t op,
                                  const bool convert_src1_to_q8_1) try {
-    std::cout << "ggml_sycl_op_mul_mat\n";
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -12810,7 +12800,9 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
 
     GGML_ASSERT(dst->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(src1->backend != GGML_BACKEND_GPU_SPLIT);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || ne12 >= ne02 && ne12 % ne02 == 0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));
+
+    GGML_ASSERT(ne12 >= ne02 && ne12 % ne02 == 0);
 
     const int64_t i02_divisor = ne12 / ne02;
 
@@ -12834,27 +12826,30 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
     GGML_ASSERT(!(split && ne03 > 1));
     GGML_ASSERT(!(split && ne02 < ne12));
 
-    // dd = data device
-    char  *  src0_dd[GGML_SYCL_MAX_DEVICES] = {nullptr};
-    float * src1_ddf[GGML_SYCL_MAX_DEVICES] = {nullptr}; // float
-    char  * src1_ddq[GGML_SYCL_MAX_DEVICES] = {nullptr}; // q8_1
-    float *   dst_dd[GGML_SYCL_MAX_DEVICES] = {nullptr};
 
-    // as = actual size
-    size_t  src0_as[GGML_SYCL_MAX_DEVICES] = {0};
-    size_t src1_asf[GGML_SYCL_MAX_DEVICES] = {0};
-    size_t src1_asq[GGML_SYCL_MAX_DEVICES] = {0};
-    size_t   dst_as[GGML_SYCL_MAX_DEVICES] = {0};
+    struct dev_data {
+        sycl_pool_alloc<char>  src0_dd_alloc;
+        sycl_pool_alloc<float> src1_ddf_alloc;
+        sycl_pool_alloc<char>  src1_ddq_alloc;
+        sycl_pool_alloc<float>   dst_dd_alloc;
 
-    int64_t  row_low[GGML_SYCL_MAX_DEVICES];
-    int64_t row_high[GGML_SYCL_MAX_DEVICES];
+        char  *  src0_dd = nullptr;
+        float * src1_ddf = nullptr; // float
+        char  * src1_ddq = nullptr; // q8_1
+        float *   dst_dd = nullptr;
+
+        int64_t  row_low;
+        int64_t row_high;
+    };
+
+    dev_data dev[GGML_SYCL_MAX_DEVICES];
 
     int used_devices = 0;
 
     for (int64_t id = 0; id < g_device_count; ++id) {
         // by default, use all rows
-        row_low[id]  = 0;
-        row_high[id] = ne01;
+        dev[id].row_low  = 0;
+        dev[id].row_high = ne01;
 
         // for multi GPU, get the row boundaries from tensor split
         // and round to mul_mat_q tile sizes
@@ -12862,23 +12857,23 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
             const int64_t rounding = get_row_rounding(src0->type);
 
             if (id != 0) {
-                row_low[id]  = ne01*g_tensor_split[id];
-                if (row_low[id] < ne01) {
-                    row_low[id] -= row_low[id] % rounding;
+                dev[id].row_low  = ne01*g_tensor_split[id];
+                if (dev[id].row_low < ne01) {
+                    dev[id].row_low -= dev[id].row_low % rounding;
                 }
             }
 
             if (id != g_device_count - 1) {
-                row_high[id]  = ne01*g_tensor_split[id + 1];
-                if (row_high[id] < ne01) {
-                    row_high[id] -= row_high[id] % rounding;
+                dev[id].row_high  = ne01*g_tensor_split[id + 1];
+                if (dev[id].row_high < ne01) {
+                    dev[id].row_high -= dev[id].row_high % rounding;
                 }
             }
         }
     }
     for (int64_t id = 0; id < g_device_count; ++id) {
 
-        if ((!split && id != g_main_device_index) || row_low[id] == row_high[id]) {
+        if ((!split && id != g_main_device_index) || dev[id].row_low == dev[id].row_high) {
             continue;
         }
 
@@ -12891,37 +12886,30 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
         const dpct::queue_ptr stream = g_syclStreams[id][0];
 
         if (src0_on_device && src0_is_contiguous) {
-            src0_dd[id] = (char *) src0_extra->data_device[id];
+            dev[id].src0_dd = (char *) src0_extra->data_device[id];
         } else {
-            // const size_t size_src0_ddq = split ? (row_high[id]-row_low[id])*ne00 * src0_ts/src0_bs : ggml_nbytes(src0);
-            src0_dd[id] = (char *) ggml_sycl_pool_malloc(ggml_nbytes(src0), &src0_as[id]);
+            dev[id].src0_dd = dev[id].src0_dd_alloc.alloc(ggml_nbytes(src0));
         }
 
         if (src1_on_device && src1_is_contiguous) {
-            src1_ddf[id] = (float *) src1_extra->data_device[id];
+            dev[id].src1_ddf = (float *) src1_extra->data_device[id];
         } else {
-            src1_ddf[id] = (float *) ggml_sycl_pool_malloc(ggml_nbytes(src1), &src1_asf[id]);
+            dev[id].src1_ddf = dev[id].src1_ddf_alloc.alloc(ggml_nelements(src1));
         }
 
         if (convert_src1_to_q8_1) {
-            src1_ddq[id] = (char *) ggml_sycl_pool_malloc(nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs, &src1_asq[id]);
+            dev[id].src1_ddq = dev[id].src1_ddq_alloc.alloc(nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
 
             if (src1_on_device && src1_is_contiguous) {
-                quantize_row_q8_1_sycl(src1_ddf[id], src1_ddq[id], ne10, nrows1, src1_padded_col_size, stream);
-                /*
-                DPCT1010:90: SYCL uses exceptions to report errors and does not
-                use the error codes. The call was replaced with 0. You need to
-                rewrite this code.
-                */
-                SYCL_CHECK(0);
+                quantize_row_q8_1_sycl(dev[id].src1_ddf, dev[id].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
             }
         }
 
         if (dst_on_device) {
-            dst_dd[id] = (float *) dst_extra->data_device[id];
+            dev[id].dst_dd = (float *) dst_extra->data_device[id];
         } else {
-            const size_t size_dst_ddf = split ? (row_high[id]-row_low[id])*ne1*sizeof(float) : ggml_nbytes(dst);
-            dst_dd[id] = (float *) ggml_sycl_pool_malloc(size_dst_ddf, &dst_as[id]);
+            const size_t size_dst_ddf = split ? (dev[id].row_high - dev[id].row_low)*ne1 : ggml_nelements(dst);
+            dev[id].dst_dd = dev[id].dst_dd_alloc.alloc(size_dst_ddf);
         }
     }
 
@@ -12929,11 +12917,6 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
     // here an event is recorded that signals that the main device has finished calculating the input data
     if (split && used_devices > 1) {
         SYCL_CHECK(ggml_sycl_set_device(g_main_device));
-        /*
-        DPCT1024:91: The original code returned the error code that was further
-        consumed by the program logic. This original code was replaced with 0.
-        You may need to rewrite the program logic consuming the error code.
-        */
         SYCL_CHECK(CHECK_TRY_ERROR(
             *src0_extra->events[g_main_device_index][0] =
                 g_syclStreams[g_main_device_index][0]->ext_oneapi_submit_barrier()));
@@ -12945,13 +12928,13 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
         const int64_t src1_ncols = src1_col_0 + src1_col_stride > ne11 ? ne11 - src1_col_0 : src1_col_stride;
 
         for (int64_t id = 0; id < g_device_count; ++id) {
-            if ((!split && id != g_main_device_index) || row_low[id] == row_high[id]) {
+            if ((!split && id != g_main_device_index) || dev[id].row_low == dev[id].row_high) {
                 continue;
             }
 
             const bool src1_on_device = src1->backend == GGML_BACKEND_GPU && id == g_main_device_index;
             const bool  dst_on_device =  dst->backend == GGML_BACKEND_GPU && id == g_main_device_index;
-            const int64_t row_diff = row_high[id] - row_low[id];
+            const int64_t row_diff = dev[id].row_high - dev[id].row_low;
 
             ggml_sycl_set_device(get_device_id_by_index(id));
             const dpct::queue_ptr stream = g_syclStreams[id][is];
@@ -12969,22 +12952,22 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                 const size_t src1_ddq_i_offset = (i0*ne11 + src1_col_0) * src1_padded_col_size*q8_1_ts/q8_1_bs;
 
                 // for split tensors the data begins at i0 == i0_offset_low
-                char  *  src0_dd_i =  src0_dd[id] + (i0/i02_divisor) * (ne01*ne00*src0_ts)/src0_bs;
-                float * src1_ddf_i = src1_ddf[id] + (i0*ne11 + src1_col_0) * ne10;
-                char  * src1_ddq_i = src1_ddq[id] +  src1_ddq_i_offset;
-                float *   dst_dd_i =   dst_dd[id] + (i0*ne1  + src1_col_0) * (dst_on_device ? ne0 : row_diff);
+                char  *  src0_dd_i =  dev[id].src0_dd + (i0/i02_divisor) * (ne01*ne00*src0_ts)/src0_bs;
+                float * src1_ddf_i = dev[id].src1_ddf + (i0*ne11 + src1_col_0) * ne10;
+                char  * src1_ddq_i = dev[id].src1_ddq +  src1_ddq_i_offset;
+                float *   dst_dd_i =   dev[id].dst_dd + (i0*ne1  + src1_col_0) * (dst_on_device ? ne0 : row_diff);
 
                 // the main device memory buffer can be on VRAM scratch, with space for all partial results
                 // in that case an offset on dst_ddf_i is needed
                 if (dst->backend == GGML_BACKEND_GPU && id == g_main_device_index) {
-                    dst_dd_i += row_low[id]; // offset is 0 if no tensor split
+                    dst_dd_i += dev[id].row_low; // offset is 0 if no tensor split
                 }
 
                 // copy src0, src1 to device if necessary
                 if (src1->backend == GGML_BACKEND_GPU && src1_is_contiguous) {
                     if (id != g_main_device_index) {
                         if (convert_src1_to_q8_1) {
-                            char * src1_ddq_i_source = src1_ddq[g_main_device_index] + src1_ddq_i_offset;
+                            char * src1_ddq_i_source = dev[g_main_device].src1_ddq + src1_ddq_i_offset;
                             SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
                                 src1_ddq_i, src1_ddq_i_source,
                                 src1_ncols * src1_padded_col_size * q8_1_ts /
@@ -13006,29 +12989,19 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
 
                 if (convert_src1_to_q8_1 && (src1->backend == GGML_BACKEND_CPU || !src1_is_contiguous)) {
                     quantize_row_q8_1_sycl(src1_ddf_i, src1_ddq_i, ne10, src1_ncols, src1_padded_col_size, stream);
-                    /*
-                    DPCT1010:92: SYCL uses exceptions to report errors and does
-                    not use the error codes. The call was replaced with 0. You
-                    need to rewrite this code.
-                    */
-                    SYCL_CHECK(0);
                 }
 
                 if (src1_col_0 == 0 && (!src0_on_device || !src0_is_contiguous) && i02 % i02_divisor == 0) {
-                    SYCL_CHECK(ggml_sycl_cpy_tensor_2d(src0_dd_i, src0, i03, i02/i02_divisor, row_low[id], row_high[id], stream));
+                    SYCL_CHECK(ggml_sycl_cpy_tensor_2d(src0_dd_i, src0, i03, i02/i02_divisor,  dev[id].row_low, dev[id].row_high, stream));
                 }
-                if (src1->type == GGML_TYPE_F16) {
-                    src1_padded_col_size = (i0 * ne11 + src1_col_0) * ne10;
-                }
+                //if (src1->type == GGML_TYPE_F16) {
+                //    src1_padded_col_size = (i0 * ne11 + src1_col_0) * ne10;
+                //}
                 // do the computation
+                stream->wait_and_throw();
                 op(src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
-                   row_low[id], row_high[id], src1_ncols, src1_padded_col_size, stream);
-                /*
-                DPCT1010:93: SYCL uses exceptions to report errors and does not
-                use the error codes. The call was replaced with 0. You need to
-                rewrite this code.
-                */
-                SYCL_CHECK(0);
+                    dev[id].row_low, dev[id].row_high, src1_ncols, src1_padded_col_size, stream);
+                stream->wait_and_throw();
 
                 // copy dst to host or other device if necessary
                 if (!dst_on_device) {
@@ -13051,7 +13024,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                         // If dst is a vector with ne0 == 1 then you don't have to do this but it still produces correct results.
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02*nb2 + i03*nb3);
                         GGML_ASSERT(dst->nb[1] == ne0*sizeof(float));
-                        dhf_dst_i += src1_col_0*ne0 + row_low[id];
+                        dhf_dst_i += src1_col_0*ne0 + dev[id].row_low;;
                         SYCL_CHECK(CHECK_TRY_ERROR(dpct::async_dpct_memcpy(
                             dhf_dst_i, ne0 * sizeof(float), dst_dd_i,
                             row_diff * sizeof(float), row_diff * sizeof(float),
@@ -13068,38 +13041,11 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
 
                 // add event for the main device to wait on until other device is done
                 if (split && (id != g_main_device_index || is != 0)) {
-                    /*
-                    DPCT1024:94: The original code returned the error code that
-                    was further consumed by the program logic. This original
-                    code was replaced with 0. You may need to rewrite the
-                    program logic consuming the error code.
-                    */
                     SYCL_CHECK(CHECK_TRY_ERROR(
                         *src0_extra->events[id][is] =
                             stream->ext_oneapi_submit_barrier()));
                 }
             }
-        }
-    }
-
-    for (int64_t id = 0; id < g_device_count; ++id) {
-        if ((!split && id != g_main_device_index) || row_low[id] == row_high[id]) {
-            continue;
-        }
-        SYCL_CHECK(ggml_sycl_set_device(get_device_id_by_index(id)));
-
-        // free buffers again when done
-        if (dst_as[id] > 0) {
-            ggml_sycl_pool_free(dst_dd[id], dst_as[id]);
-        }
-        if (src1_asq[id] > 0) {
-            ggml_sycl_pool_free(src1_ddq[id], src1_asq[id]);
-        }
-        if (src1_asf[id] > 0) {
-            ggml_sycl_pool_free(src1_ddf[id], src1_asf[id]);
-        }
-        if (src0_as[id] > 0) {
-            ggml_sycl_pool_free(src0_dd[id], src0_as[id]);
         }
     }
 
@@ -13110,7 +13056,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
 
         SYCL_CHECK(ggml_sycl_set_device(g_main_device));
         for (int64_t id = 0; id < g_device_count; ++id) {
-            if (row_low[id] == row_high[id]) {
+            if (dev[id].row_low == dev[id].row_high) {
                 continue;
             }
             for (int64_t is = 0; is < is_max; ++is) {
@@ -13257,7 +13203,6 @@ bool ggml_sycl_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_te
 static void ggml_sycl_mul_mat_vec_p021(const ggml_tensor *src0,
                                        const ggml_tensor *src1,
                                        ggml_tensor *dst) try {
-    std::cout << "ggml_sycl_mul_mat_vec_p021\n";
     GGML_ASSERT(ggml_is_permuted(src0) && ggml_is_permuted(src1));
     GGML_ASSERT(src0->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(src0->nb[0] <= src0->nb[1] && src0->nb[2] <= src0->nb[3]); // 0213 permutation
@@ -13294,7 +13239,6 @@ catch (sycl::exception const &exc) {
 static void ggml_sycl_mul_mat_vec_nc(const ggml_tensor *src0,
                                      const ggml_tensor *src1,
                                      ggml_tensor *dst) try {
-    std::cout << "ggml_sycl_mul_mat_vec_nc\n";
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
     GGML_ASSERT(!ggml_is_permuted(src0));
@@ -13354,42 +13298,23 @@ static void k_compute_batched_ptrs(const sycl::half *src0_as_f16,
     int64_t i03 = i13 / r3;
     int64_t i02 = i12 / r2;
 
-    ptrs_src[0*ne23 + i12 + i13*ne12] = (const char *) src0_as_f16 + i02*nb02   + i03*nb03;
-    ptrs_src[1*ne23 + i12 + i13*ne12] = (const char *) src1_as_f16 + i12*nb12/2 + i13*nb13/2;
-    ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2   + i13*nbd3;
+    ptrs_src[0*ne23 + i12 + i13*ne12] = (const char *) src0_as_f16 + i02*nb02 + i03*nb03;
+    ptrs_src[1*ne23 + i12 + i13*ne12] = (const char *) src1_as_f16 + i12*nb12 + i13*nb13;
+    ptrs_dst[0*ne23 + i12 + i13*ne12] = (      char *)         dst + i12*nbd2 + i13*nbd3;
 }
 
 static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
                                                  const ggml_tensor *src1,
                                                  ggml_tensor *dst) try {
-    std::cout << "ggml_sycl_mul_mat_batched_sycl\n";
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
 
     GGML_ASSERT(src0->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(src0->type == GGML_TYPE_F16);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-    const int64_t ne00 = src0->ne[0]; GGML_UNUSED(ne00);
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
+    GGML_TENSOR_BINARY_OP_LOCALS
 
-    const int64_t nb01 = src0->nb[1];
-    const int64_t nb02 = src0->nb[2]; GGML_UNUSED(nb02);
-    const int64_t nb03 = src0->nb[3]; GGML_UNUSED(nb03);
-
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-
-    const int64_t nb11 = src1->nb[1];
-    const int64_t nb12 = src1->nb[2]; GGML_UNUSED(nb12);
-    const int64_t nb13 = src1->nb[3]; GGML_UNUSED(nb13);
-
-    const int64_t ne1 = ggml_nelements(src1);
-    const int64_t ne  = ggml_nelements(dst);
+    const int64_t ne_dst = ggml_nelements(dst);
 
     SYCL_CHECK(ggml_sycl_set_device(g_main_device));
     dpct::queue_ptr main_stream = g_syclStreams[g_main_device_index][0];
@@ -13399,7 +13324,7 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
 
     ggml_tensor_extra_gpu * src0_extra = (ggml_tensor_extra_gpu *) src0->extra;
     void * src0_ddq = src0_extra->data_device[g_main_device_index];
-    sycl::half *src0_as_f16 = (sycl::half *)src0_ddq;
+    sycl::half *src0_f16 = (sycl::half *)src0_ddq;
 
     ggml_tensor_extra_gpu * src1_extra = (ggml_tensor_extra_gpu *) src1->extra;
     float * src1_ddf = (float *) src1_extra->data_device[g_main_device_index];
@@ -13408,11 +13333,16 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
     float * dst_ddf = (float *) dst_extra->data_device[g_main_device_index];
 
     // convert src1 to fp16
-    const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type);
-    GGML_ASSERT(to_fp16_sycl != nullptr);
-
-    sycl_pool_alloc<sycl::half> src1_as_f16(ne1);
-    to_fp16_sycl(src1_ddf, src1_as_f16.get(), ne1, main_stream);
+    sycl_pool_alloc<sycl::half> src1_f16_alloc;
+    if (src1->type != GGML_TYPE_F16) {
+        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type);
+        const int64_t ne_src1 = ggml_nelements(src1);
+        src1_f16_alloc.alloc(ne_src1);
+        GGML_ASSERT(to_fp16_sycl != nullptr);
+        to_fp16_sycl(src1_ddf, src1_f16_alloc.get(), ne_src1, main_stream);
+        main_stream->wait_and_throw();
+    }
+    sycl::half * src1_f16 = src1->type == GGML_TYPE_F16 ? (sycl::half *) src1_ddf : src1_f16_alloc.get();
 
     sycl_pool_alloc<sycl::half> dst_f16;
     char * dst_t;
@@ -13424,17 +13354,17 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
     size_t nbd2 = dst->nb[2];
     size_t nbd3 = dst->nb[3];
 
-    const sycl::half alpha_f16 = 1.0f;
-    const sycl::half beta_f16 = 0.0f;
+    sycl::half alpha_f16 = 1.0f;
+    sycl::half beta_f16 = 0.0f;
 
-    const float alpha_f32 = 1.0f;
-    const float beta_f32  = 0.0f;
+    float alpha_f32 = 1.0f;
+    float beta_f32  = 0.0f;
 
-    const void * alpha = &alpha_f16;
-    const void * beta  = &beta_f16;
+    void * alpha = &alpha_f16;
+    void * beta  = &beta_f16;
 
     if (dst->op_params[0] == GGML_PREC_DEFAULT) {
-        dst_t = (char *) dst_f16.alloc(ne);
+        dst_t = (char *) dst_f16.alloc(ne_dst);
 
         nbd2 /= sizeof(float) / sizeof(sycl::half);
         nbd3 /= sizeof(float) / sizeof(sycl::half);
@@ -13477,18 +13407,16 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
 #else
     if (r2 == 1 && r3 == 1 && src0->nb[2]*src0->ne[2] == src0->nb[3] && src1->nb[2]*src1->ne[2] == src1->nb[3]) {
         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
-        // use syclGemmStridedBatchedEx
+        // use dpct::gemm_batch
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
             *g_sycl_handles[g_main_device_index], oneapi::mkl::transpose::trans,
             oneapi::mkl::transpose::nontrans, ne01, ne11, ne10, alpha,
-            (const char *)src0_as_f16, dpct::library_data_t::real_half,
-            nb01 / sizeof(sycl::half), src0->nb[2] / sizeof(sycl::half),
-            (const char *)src1_as_f16.get(), dpct::library_data_t::real_half,
-            nb11 / sizeof(float), src1->nb[2] / sizeof(float), beta,
-            (char *)dst_t, cu_data_type, ne01, dst->nb[2] / sizeof(float),
+            (const char *)src0_f16, dpct::library_data_t::real_half, nb01/nb00, nb02/nb00,
+            (const char *)src1_f16, dpct::library_data_t::real_half, nb11/nb10, nb12/nb10, 
+            beta, (char *)dst_t, cu_data_type, ne01, nb2/nb0,
             ne12 * ne13, cu_compute_type)));
     } else {
-        // use syclGemmBatchedEx
+        // use dpct::gemm_batch
         const int ne23 = ne12*ne13;
 
         sycl_pool_alloc<const void *> ptrs_src(2*ne23);
@@ -13500,25 +13428,29 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
         the limit. To get the device limit, query
         info::device::max_work_group_size. Adjust the work-group size if needed.
         */
+        main_stream->wait_and_throw();
         {
             dpct::has_capability_or_fail(main_stream->get_device(),
                                          {sycl::aspect::fp16});
 
+            auto ptrs_src_get = ptrs_src.get();
+            auto ptrs_dst_get = ptrs_dst.get();
             main_stream->submit([&](sycl::handler &cgh) {
-                const sycl::half *src1_as_f16_get_ct1 = src1_as_f16.get();
-                const void **ptrs_src_get_ct3 = ptrs_src.get();
-                void **ptrs_dst_get_ct4 = ptrs_dst.get();
-
+                auto nb12_get = src1->type == GGML_TYPE_F16 ? nb12 : nb12/2;
+                auto nb13_get = src1->type == GGML_TYPE_F16 ? nb13 : nb13/2;
                 cgh.parallel_for(sycl::nd_range<3>(block_dims, block_dims),
                                  [=](sycl::nd_item<3> item_ct1) {
                                      k_compute_batched_ptrs(
-                                         src0_as_f16, src1_as_f16_get_ct1,
-                                         dst_t, ptrs_src_get_ct3,
-                                         ptrs_dst_get_ct4, ne12, ne13, ne23,
-                                         nb02, nb03, nb12, nb13, nbd2, nbd3, r2,
+                                         src0_f16, src1_f16,
+                                         dst_t, ptrs_src_get,
+                                         ptrs_dst_get, ne12, ne13, ne23,
+                                         nb02, nb03, 
+                                         nb12_get,
+                                         nb13_get,
+                                         nbd2, nbd3, r2,
                                          r3, item_ct1);
                                  });
-            });
+            }).wait();
         }
         /*
         DPCT1010:95: SYCL uses exceptions to report errors and does not use the
@@ -13530,18 +13462,17 @@ static void ggml_sycl_mul_mat_mat_batched_sycl(const ggml_tensor *src0,
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
             *g_sycl_handles[g_main_device_index], oneapi::mkl::transpose::trans,
             oneapi::mkl::transpose::nontrans, ne01, ne11, ne10, alpha,
-            (const void **)(ptrs_src.get() + 0 * ne23),
-            dpct::library_data_t::real_half, nb01 / sizeof(sycl::half),
-            (const void **)(ptrs_src.get() + 1 * ne23),
-            dpct::library_data_t::real_half, nb11 / sizeof(float), beta,
-            (void **)(ptrs_dst.get() + 0 * ne23), cu_data_type, ne01, ne23,
-            cu_compute_type)));
+            (const void **)(ptrs_src.get() + 0 * ne23), dpct::library_data_t::real_half, nb01/nb00,
+            (const void **)(ptrs_src.get() + 1 * ne23), dpct::library_data_t::real_half, nb11/nb10, 
+            beta, (void **)(ptrs_dst.get() + 0 * ne23), cu_data_type, ne01, 
+            ne23, cu_compute_type)));
+        main_stream->wait_and_throw();
     }
 #endif
 
     if (dst->op_params[0] == GGML_PREC_DEFAULT) {
         const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(GGML_TYPE_F16);
-        to_fp32_sycl(dst_f16.get(), dst_ddf, ne, main_stream);
+        to_fp32_sycl(dst_f16.get(), dst_ddf, ne_dst, main_stream);
     }
 }
 catch (sycl::exception const &exc) {
@@ -13551,11 +13482,11 @@ catch (sycl::exception const &exc) {
 }
 
 static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    std::cout << "ggml_sycl_mul_mat\n";
     const bool all_on_device =
         (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         (src1->backend == GGML_BACKEND_GPU) &&
         ( dst->backend == GGML_BACKEND_GPU);
+
 
     const bool split = src0->backend == GGML_BACKEND_GPU_SPLIT;
 
@@ -13566,19 +13497,15 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
         }
     }
 
-#ifdef SYCL_USE_XMX
     const bool use_xmx = true;
-#else
-    const bool use_xmx = false;
-#endif
 
     // debug helpers
-    //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
-    //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
-    //printf("src1: %8d %8d %8d %8d\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-    //printf("      %8d %8d %8d %8d\n", src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
-    //printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
-    //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
+    printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+    printf("src1: %8d %8d %8d %8d\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+    printf("      %8d %8d %8d %8d\n", src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+    printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
+    printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
 
     if (!split && all_on_device && !use_xmx && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // KQ single-batch
@@ -13588,7 +13515,7 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
         // KQV single-batch
         // GGML_SYCL_DEBUG("ggml_sycl_mul_mat_vec_nc\n");
         ggml_sycl_mul_mat_vec_nc(src0, src1, dst);
-    } else if (!split && all_on_device && use_xmx && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+    } else if (!split && all_on_device && use_xmx && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
         // KQ + KQV multi-batch
         // GGML_SYCL_DEBUG("ggml_sycl_mul_mat_mat_batched_sycl\n");
         ggml_sycl_mul_mat_mat_batched_sycl(src0, src1, dst);
@@ -13615,15 +13542,16 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
         } else {
             bool use_mul_mat_q = min_compute_capability >= VER_4VEC && ggml_is_quantized(src0->type);
 
-            if (use_xmx && min_compute_capability >= VER_GEN9 && src1->ne[1] > XMX_MAX_BATCH_SIZE) {
-                use_mul_mat_q = false;
-            }
+            //if (use_xmx && min_compute_capability >= VER_GEN9 && src1->ne[1] > XMX_MAX_BATCH_SIZE) {
+            //    use_mul_mat_q = false;
+            //}
 
-            if (use_mul_mat_q) {
-                // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_q path\n");
+
+            if (src1->ne[1] <= 4 && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32) {
+                ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_vec_q, true);
+            } else if (use_mul_mat_q) {
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_q, true);
             } else {
-                // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_sycl path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_sycl, false);
             }
         }
