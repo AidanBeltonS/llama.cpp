@@ -305,6 +305,7 @@ namespace dpct
         int get_max_compute_units() const { return _max_compute_units; }
         int get_max_work_group_size() const { return _max_work_group_size; }
         int get_max_sub_group_size() const { return _max_sub_group_size; }
+        int get_min_sub_group_size() const { return _min_sub_group_size; }
         int get_max_work_items_per_compute_unit() const
         {
             return _max_work_items_per_compute_unit;
@@ -411,6 +412,10 @@ namespace dpct
         {
             _max_sub_group_size = max_sub_group_size;
         }
+        void set_min_sub_group_size(int min_sub_group_size)
+        {
+            _min_sub_group_size = min_sub_group_size;
+        }
         void
         set_max_work_items_per_compute_unit(int max_work_items_per_compute_unit)
         {
@@ -466,6 +471,7 @@ namespace dpct
         int _max_compute_units;
         int _max_work_group_size;
         int _max_sub_group_size;
+        int _min_sub_group_size;
         int _max_work_items_per_compute_unit;
         int _max_register_size_per_work_group;
         size_t _global_mem_size;
@@ -558,7 +564,8 @@ namespace dpct
         Use 64 bits as memory_bus_width default value."
 #endif
 
-        size_t max_sub_group_size = 1;
+        size_t max_sub_group_size = std::numeric_limits<size_t>::min();
+        size_t min_sub_group_size = std::numeric_limits<size_t>::max();
         std::vector<size_t> sub_group_sizes =
             dev.get_info<sycl::info::device::sub_group_sizes>();
 
@@ -566,9 +573,12 @@ namespace dpct
         {
             if (max_sub_group_size < sub_group_size)
                 max_sub_group_size = sub_group_size;
+            if (min_sub_group_size > sub_group_size)
+                min_sub_group_size = sub_group_size;
         }
 
         prop.set_max_sub_group_size(max_sub_group_size);
+        prop.set_min_sub_group_size(min_sub_group_size);
 
         prop.set_max_work_items_per_compute_unit(
             dev.get_info<sycl::info::device::max_work_group_size>());
@@ -629,6 +639,11 @@ namespace dpct
         int get_max_sub_group_size() const
         {
             return get_device_info().get_max_sub_group_size();
+        }
+
+        int get_min_sub_group_size() const
+        {
+            return get_device_info().get_min_sub_group_size();
         }
 
         int get_max_register_size_per_work_group() const
@@ -3580,6 +3595,7 @@ class sycl_gpu_mgr {
     public:
         std::vector<int> gpus;
         std::vector<sycl::device> devices;
+        std::vector<dpct::device_info> device_prop;
         sycl::queue *first_queue;
         sycl::context co_ctx;
         int max_compute_units = 0;
@@ -3639,6 +3655,7 @@ class sycl_gpu_mgr {
                     prop.get_major_version() == 1) {
                     gpus.push_back(id);
                     devices.push_back(device);
+                    device_prop.push_back(prop);
                     work_group_size = prop.get_max_work_group_size();
                 }
             }
@@ -3669,6 +3686,14 @@ class sycl_gpu_mgr {
             assert(false);
             return -1;
         }
+
+        // returns get_gpu_count() as id if device not found
+        int get_index(const sycl::device &dev) {
+            for (uint32_t i = 0; i < gpus.size(); ++i)
+                if (devices[i] == dev)
+                    return i;
+            return gpus.size();
+        }
 };
 
 static sycl_gpu_mgr *g_sycl_gpu_mgr = NULL;
@@ -3676,6 +3701,25 @@ static int g_device_count = -1;
 static int g_all_sycl_device_count = -1;
 static int g_main_device = -1;
 static int g_main_device_id = -1;
+
+// GPU mgr helpers
+inline int get_max_sub_group(const sycl::device& dev) {
+    int id = g_sycl_gpu_mgr->get_index(dev);
+    GGML_ASSERT(id != g_sycl_gpu_mgr->get_gpu_count());
+    auto prop = g_sycl_gpu_mgr->device_prop[id];
+    return prop.get_max_sub_group_size();
+}
+
+inline int get_min_sub_group(const sycl::device& dev) {
+    int id = g_sycl_gpu_mgr->get_index(dev);
+    GGML_ASSERT(id != g_sycl_gpu_mgr->get_gpu_count());
+    auto prop = g_sycl_gpu_mgr->device_prop[id];
+    return prop.get_min_sub_group_size();
+}
+
+size_t ceiling_div(size_t a, size_t b) {
+    return (a + (b - 1)) / b;
+}
 
 static std::array<float, GGML_SYCL_MAX_DEVICES> g_default_tensor_split = {};
 
@@ -4136,6 +4180,9 @@ static void sqr_f32(const float * x, float * dst, const int k,
 
 static void norm_f32(const float * x, float * dst, const int ncols, const float eps,
                      const sycl::nd_item<3> &item_ct1, sycl::float2 *s_sum, int block_size) {
+    sycl::sub_group sg = item_ct1.get_sub_group();
+    const uint32_t sg_local_range = sg.get_local_linear_range();
+
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
                     item_ct1.get_local_id(1);
     const int tid = item_ct1.get_local_id(2);
@@ -4150,17 +4197,15 @@ static void norm_f32(const float * x, float * dst, const int ncols, const float 
 
     // sum up partial sums
     mean_var = warp_reduce_sum(mean_var, item_ct1);
-    if (block_size > WARP_SIZE) {
+    if (block_size > sg_local_range) {
 
-        int warp_id = item_ct1.get_local_id(2) / WARP_SIZE;
-        int lane_id = item_ct1.get_local_id(2) % WARP_SIZE;
+        size_t warp_id = sg.get_group_linear_id();
+        size_t lane_id = sg.get_local_linear_id();
+
         if (lane_id == 0) {
             s_sum[warp_id] = mean_var;
         }
-        /*
-        DPCT1118:0: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
+
         item_ct1.barrier(sycl::access::fence_space::local_space);
         mean_var = s_sum[lane_id];
         mean_var = warp_reduce_sum(mean_var, item_ct1);
@@ -9890,39 +9935,38 @@ static void sqr_f32_sycl(const float *x, float *dst, const int k,
 static void norm_f32_sycl(const float *x, float *dst, const int ncols,
                           const int nrows, const float eps,
                           dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % WARP_SIZE == 0);
-    if (ncols < 1024) {
-        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+    size_t max_sg_size = get_max_sub_group(stream->get_device());
+    size_t min_sg_size = get_min_sub_group(stream->get_device());
+
+    GGML_ASSERT(ncols % max_sg_size == 0);
+    if (ncols < g_work_group_size) {
+        size_t sg_ratio = ceiling_div(max_sg_size, min_sg_size);
+        size_t local_mem_size = sg_ratio == 1 ? 0 : sg_ratio;
+        const sycl::range<3> block_dims(1, 1, max_sg_size);
         stream->submit([&](sycl::handler &cgh) {
             sycl::local_accessor<sycl::float2, 1> s_sum_acc_ct1(
-                sycl::range<1>(32), cgh);
+                sycl::range<1>(local_mem_size), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<3>(sycl::range<3>(1, 1, nrows) * block_dims,
                                   block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                    [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<3> item_ct1) {
                         norm_f32(x, dst, ncols, eps, item_ct1,
-                                            s_sum_acc_ct1.get_pointer(), WARP_SIZE);
+                                            s_sum_acc_ct1.get_pointer(), max_sg_size);
                     });
         });
     } else {
         const int work_group_size = g_work_group_size;
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:17: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
+
         stream->submit([&](sycl::handler &cgh) {
             sycl::local_accessor<sycl::float2, 1> s_sum_acc_ct1(
-                sycl::range<1>(32), cgh);
+                sycl::range<1>(work_group_size/min_sg_size), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<3>(sycl::range<3>(1, 1, nrows) * block_dims,
                                   block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                    [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<3> item_ct1) {
                         norm_f32(x, dst, ncols, eps, item_ct1,
                                        s_sum_acc_ct1.get_pointer(), work_group_size);
                     });
