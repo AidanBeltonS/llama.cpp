@@ -3471,7 +3471,7 @@ void log_ggml_var_device_fp16(const char*name, sycl::half *src, size_t total_ele
         local_buf = (sycl::half *) ggml_sycl_host_malloc(total_size);
         ggml_sycl_set_device(g_main_device);
         dpct::queue_ptr main_stream = g_syclStreams[g_main_device][0];
-        main_stream->memcpy(local_buf, src, total_size).wait();
+        main_stream->memcpy(local_buf, src, total_size);
     }
     else {
         local_buf = (sycl::half *)src;
@@ -14435,7 +14435,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
             src1_ptr, dpct::library_data_t::real_half, ne10, &beta_f16,
             dst_f16.get(), dpct::library_data_t::real_half, ldc,
             dpct::library_data_t::real_half)));
-        g_sycl_handles[id]->wait();
         const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(GGML_TYPE_F16);
         to_fp32_sycl(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
     }
@@ -14468,7 +14467,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
             dpct::get_value(&alpha, *g_sycl_handles[id]), src0_ddf_i, ne00,
             src1_ddf1_i, ne10, dpct::get_value(&beta, *g_sycl_handles[id]),
             dst_dd_i, ldc)));
-        g_sycl_handles[id]->wait();
     }
     (void) dst;
     (void) src1_ddq_i;
@@ -15685,7 +15683,6 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
             nb11 / nb10, nb12 / nb10, beta,
             (char *)dst_t, cu_data_type, ne01, nb2 / nb0,
             ne12 * ne13, cu_compute_type)));
-        g_sycl_handles[g_main_device]->wait();
     } else {
         const int ne23 = ne12*ne13;
 
@@ -15716,7 +15713,7 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
                                          nb02, nb03, nb12_scaled, nb13_scaled,
                                          nbd2, nbd3, r2, r3, item_ct1);
                                  });
-            }).wait();
+            });
         }
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
             *g_sycl_handles[g_main_device], oneapi::mkl::transpose::trans,
@@ -15727,7 +15724,6 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
             dpct::library_data_t::real_half, nb11 / nb10, beta,
             (void **)(ptrs_dst.get() + 0 * ne23), cu_data_type, ne01, ne23,
             cu_compute_type)));
-        g_sycl_handles[g_main_device]->wait();
     }
 #endif
 
