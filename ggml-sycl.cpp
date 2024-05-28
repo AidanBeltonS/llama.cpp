@@ -4281,7 +4281,7 @@ static void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restri
 }
 
 #if QK_K == 256
-static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+static inline void get_scale_min_k4(int j, const uint8_t * __restrict__ q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
         d = q[j] & 63; m = q[j + 4] & 63;
     } else {
