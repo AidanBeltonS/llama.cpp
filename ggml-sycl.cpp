@@ -4318,9 +4318,12 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const float d1 = dall * sc; const float m1 = dmin * m;
     get_scale_min_k4(is + 1, x[i].scales, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
-    for (int l = ir; l < n*8; l+=8) {
-        y[l + 0] = d1 * (q[l] & 0xF) - m1;
-        y[l +32] = d2 * (q[l] >>  4) - m2;
+
+#pragma unroll
+    for (int l = 0; l < n*8; l+=8) {
+        const int idx = l + ir;
+        y[idx + 0] = d1 * (q[idx] & 0xF) - m1;
+        y[idx +32] = d2 * (q[idx] >>  4) - m2;
     }
 #else
     const int tid = item_ct1.get_local_id(2);
