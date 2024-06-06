@@ -10314,7 +10314,7 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int k,
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                      dpct::queue_ptr stream) {
-    const int wg_size = 64;
+    const int wg_size = 32;
     const int sg_size = 32;
     const int n_sg = wg_size/sg_size;
     const int nb = k / (QK_K * n_sg);
