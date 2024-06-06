@@ -4293,7 +4293,7 @@ static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8
 #endif
 
 template<typename dst_t>
-static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy, uint8_t* scales_local,
+static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy, sycl::vec<uint8_t, 4>* scales_vec_local,
                                   const sycl::nd_item<3> &item_ct1) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
@@ -4315,12 +4315,11 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const float dall = dm[0];
     const float dmin = dm[1];
 
-    if (tid < 12)
-        scales_local[tid + 12*sg_group] = x[i].scales[tid];
+    if (tid < 3)
+        scales_vec_local[tid + 3*sg_group] = reinterpret_cast<const sycl::vec<uint8_t, 4>*>(x[i].scales)[tid];
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
-
-    const uint8_t * s = scales_local + 12*sg_group;
+    const uint8_t * s = (uint8_t*)(scales_vec_local + 3*sg_group);
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, s, sc, m);
@@ -10324,7 +10323,7 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                      {sycl::aspect::fp16});
 
         stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12*n_sg), cgh);
+            sycl::local_accessor<sycl::vec<uint8_t,4>, 1> scale_local_acc(sycl::range<1>(3*n_sg), cgh);
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, wg_size),
                                                sycl::range<3>(1, 1, wg_size)),
