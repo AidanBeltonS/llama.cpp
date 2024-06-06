@@ -4309,8 +4309,6 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const int is  = 2*il;
     const int n   = 4;
 
-    dst_t * y = yy + i*QK_K + 64*il + n*ir;
-
     const sycl::half2 dm = x[i].dm;
     const float dall = dm[0];
     const float dmin = dm[1];
@@ -4330,10 +4328,18 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const float m2 = dmin * m;
 
     sycl::vec<uint8_t, n> q_vec = reinterpret_cast<const sycl::vec<uint8_t, n>*>(x[i].qs + 32*il + n*ir)[0];
+    sycl::vec<dst_t, n>* y_vec = reinterpret_cast<sycl::vec<dst_t, n>*>(yy + i*QK_K + 64*il + n*ir);
+
+    sycl::vec<dst_t, n> y_tmp;
     for (int l = 0; l < n; ++l) {
-        y[l + 0] = d1 * (q_vec[l] & 0xF) - m1;
-        y[l +32] = d2 * (q_vec[l] >>  4) - m2;
+        y_tmp[l] = d1 * (q_vec[l] & 0xF) - m1;
     }
+    y_vec[0] = y_tmp;
+
+    for (int l = 0; l < n; ++l) {
+        y_tmp[l] = d2 * (q_vec[l] >>  4) - m2;
+    }
+    y_vec[32/4] = y_tmp;
 #else
     const int tid = item_ct1.get_local_id(2);
     const uint8_t * q = x[i].qs;
