@@ -4297,11 +4297,12 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
                                   const sycl::nd_item<3> &item_ct1) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
-    const int i = item_ct1.get_group(2);
+    const int tidx = item_ct1.get_global_linear_id();
+    const int i = tidx/32;
 
 #if QK_K == 256
     // assume 32 threads
-    const int tid = item_ct1.get_local_id(2);
+    const int tid = tidx%32;
     const int il  = tid/8;
     const int ir  = tid%8;
     const int is  = 2*il;
@@ -10305,14 +10306,17 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int k,
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                      dpct::queue_ptr stream) {
-    const int nb = k / QK_K;
+    const int wg_size = 64;
+    const int sg_size = 32;
+    const int n_sg = wg_size/sg_size;
+    const int nb = k / (QK_K * n_sg);
     {
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
+                                                   sycl::range<3>(1, 1, wg_size),
+                                               sycl::range<3>(1, 1, wg_size)),
                              [=](sycl::nd_item<3> item_ct1) {
                                  dequantize_block_q4_K(vx, y, item_ct1);
                              });
