@@ -4287,9 +4287,11 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     get_scale_min_k4(is + 1, scales_local, sc, m);
     const float d2 = dall * sc;
     const float m2 = dmin * m;
+
+    sycl::vec<uint8_t, n> q_vec = reinterpret_cast<const sycl::vec<uint8_t, n>*>(x[i].qs + 32*il + n*ir)[0];
     for (int l = 0; l < n; ++l) {
-        y[l + 0] = d1 * (q[l] & 0xF) - m1;
-        y[l +32] = d2 * (q[l] >>  4) - m2;
+        y[l + 0] = d1 * (q_vec[l] & 0xF) - m1;
+        y[l +32] = d2 * (q_vec[l] >>  4) - m2;
     }
 }
 
