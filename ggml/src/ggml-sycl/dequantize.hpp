@@ -309,7 +309,8 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
 
     const int tidx = item_ct1.get_global_linear_id();
     const int i = tidx / 32;
-    const int sg_group = item_ct1.get_sub_group().get_group_linear_id();
+    auto sg = item_ct1.get_sub_group();
+    const int sg_group = sg.get_group_linear_id();
 
 #if QK_K == 256
     // assume 32 threads
@@ -319,7 +320,7 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const int is  = 2*il;
     const int n   = 4;
 
-    dst_t * y = yy + i*QK_K + 64*il + n*ir;
+    sycl::vec<dst_t, n>* y = reinterpret_cast<sycl::vec<dst_t, n>*>(yy + i*QK_K + 64*il + n*ir);
 
     const sycl::half2 dm = x[i].dm;
     const float dall = dm[0];
@@ -338,10 +339,15 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const float m2 = dmin * m;
 
     sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(x[i].qs + 32*il + n*ir);
+    sycl::vec<dst_t, n> y_vec_1;
+    sycl::vec<dst_t, n> y_vec_2;
     for (int l = 0; l < n; ++l) {
-        y[l + 0] = d1 * (q_vec[l] & 0xF) - m1;
-        y[l +32] = d2 * (q_vec[l] >>  4) - m2;
+        y_vec_1[l] = d1 * (q_vec[l] & 0xF) - m1;
+        y_vec_2[l] = d2 * (q_vec[l] >>  4) - m2;
     }
+
+    y[0] = y_vec_1;
+    y[32/n] = y_vec_2;
 #else
     const int tid = item_ct1.get_local_id(2);
     const uint8_t * q = x[i].qs;
