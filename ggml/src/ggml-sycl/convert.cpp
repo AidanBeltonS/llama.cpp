@@ -147,16 +147,20 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int k,
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                      dpct::queue_ptr stream) {
-    const int nb = k / QK_K;
+    const int wg_size = 128;
+    const int sg_size = 32;
+    const int n_sg = wg_size/sg_size;
+
+    const int nb = k / (QK_K * n_sg);
     {
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 
         stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
+            sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12 * n_sg), cgh);
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                                   sycl::range<3>(1, 1, 32),
-                                               sycl::range<3>(1, 1, 32)),
+                                                   sycl::range<3>(1, 1, wg_size),
+                                               sycl::range<3>(1, 1, wg_size)),
                              [=](sycl::nd_item<3> item_ct1) {
                                  dequantize_block_q4_K(vx, y, get_pointer(scale_local_acc), item_ct1);
                              });

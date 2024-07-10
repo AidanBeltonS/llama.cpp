@@ -307,11 +307,13 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
                                   uint8_t* scales_local, const sycl::nd_item<3> &item_ct1) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
-    const int i = item_ct1.get_group(2);
+    const int tidx = item_ct1.get_global_linear_id();
+    const int i = tidx / 32;
+    const int sg_group = item_ct1.get_sub_group().get_group_linear_id();
 
 #if QK_K == 256
     // assume 32 threads
-    const int tid = item_ct1.get_local_id(2);
+    const int tid = tidx % 32;
     const int il  = tid/8;
     const int ir  = tid%8;
     const int is  = 2*il;
@@ -324,14 +326,14 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
     const float dmin = dm[1];
 
     if (tid < 12)
-        scales_local[tid] = x[i].scales[tid];
+        scales_local[tid + sg_group*12] = x[i].scales[tid];
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     uint8_t sc, m;
-    get_scale_min_k4(is + 0, scales_local, sc, m);
+    get_scale_min_k4(is + 0, scales_local + sg_group*12, sc, m);
     const float d1 = dall * sc;
     const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, scales_local, sc, m);
+    get_scale_min_k4(is + 1, scales_local + sg_group*12, sc, m);
     const float d2 = dall * sc;
     const float m2 = dmin * m;
 
