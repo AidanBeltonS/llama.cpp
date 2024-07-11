@@ -152,9 +152,14 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
     const int n_sg = wg_size/sg_size;
 
     const int nb = k / (QK_K * n_sg);
-    {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+    bool is_y_aligned = (reinterpret_cast<uintptr_t>(y) % sizeof(sycl::vec<dst_t, 4>)) == 0;
+
+    dpct::has_capability_or_fail(stream->get_device(),
+                                 {sycl::aspect::fp16});
+
+    if (is_y_aligned) {
+
+
 
         stream->submit([&](sycl::handler &cgh) {
             sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12 * n_sg), cgh);
@@ -162,7 +167,17 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
                                                    sycl::range<3>(1, 1, wg_size),
                                                sycl::range<3>(1, 1, wg_size)),
                              [=](sycl::nd_item<3> item_ct1) {
-                                 dequantize_block_q4_K(vx, y, get_pointer(scale_local_acc), item_ct1);
+                                 dequantize_block_q4_K<dst_t, true/*y_is_aligned*/>(vx, y, get_pointer(scale_local_acc), item_ct1);
+                             });
+        });
+    } else {
+        stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12 * n_sg), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, wg_size),
+                                               sycl::range<3>(1, 1, wg_size)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q4_K<dst_t, false/*y_is_aligned*/>(vx, y, get_pointer(scale_local_acc), item_ct1);
                              });
         });
     }
