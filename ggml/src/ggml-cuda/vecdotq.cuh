@@ -4,6 +4,10 @@
 
 #include <cstdint>
 
+// POC toggle for cooperative Q4_K MMVQ loads (dm + scales broadcast via warp shuffle).
+// Define = ON. Comment out / #undef to compile the path away entirely.
+#define USE_COOPERATIVE_MMVQ
+
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
     const uint8_t * x8 = (const uint8_t *) x;
 
@@ -933,17 +937,93 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
 
     const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    v[0] = q4[0];
-    v[1] = q4[4];
+    v[0] = q4[0]; // Global loads 32 bits
+    v[1] = q4[4]; // Global load 32 bits
 
     // branchless so nvcc can hoist this out of the ncols_dst loop
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     const int j  = bq8_offset/2;
     const int jm = j & 1;
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
+    const uint32_t s0 = scales[jm + 0]; // Global load 16 bits
+    const uint32_t s2 = scales[jm + 2]; // Global load 16 bits
+    const uint32_t s4 = scales[jm + 4]; // Global load 16 bits
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i; 
+        d8[i] = __low2float(bq8i->ds); // Loads 32 bits
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0]; // Global load 32 bits
+        u[2*i+1] = q8[4]; // Global load 32 bits
+    }
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8); //dm (d+dmin) loads 32 bits
+}
+
+// Cooperative variant of vec_dot_q4_K_q8_1 for RDNA4/gfx942 MMVQ.
+// Within a warp, 16 lanes share one Q4_K block (VDR_Q4_K_Q8_1_MMVQ=2 -> QI4_K/vdr=16 lanes/block).
+// The block's dm (half2) and scales (uint16_t[6]) are redundantly loaded by the original path.
+// Here: dm is loaded by seg-lane 0 and broadcast; scales are loaded as 3 int32 words by
+// seg-lanes 0/1/2 and broadcast — all via __shfl_sync(mask=0xFFFFFFFF, ..., srcLane, width=16).
+// width=16 segments the warp into independent {0..15},{16..31} groups; srcLane is relative to
+// the segment start. On HIP, __shfl_sync is redefined to __shfl (mask dropped), so 0xFFFFFFFF
+// is the correct repo-wide convention and is safe on both CUDA and HIP/wave64.
+// qs (weights) and the q8/activation-side loads are NOT cooperative — unchanged from original.
+#ifdef USE_COOPERATIVE_MMVQ
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    int    v[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    // Cooperative dm load: lane 0 of the 16-lane segment reads dm, broadcasts to the segment.
+    const int seg = threadIdx.x & 15;   // lane within the 16-lane segment
+    int dm_i = 0;
+    if (seg == 0) dm_i = *(const int *) &bq4_K->dm;
+    dm_i = __shfl_sync(0xFFFFFFFF, dm_i, 0, 16);
+    half2 dm4;
+    memcpy(&dm4, &dm_i, sizeof(dm4));   // bit-preserving int32 -> half2 (do NOT numerically convert)
+
+    // Cooperative scales load: lanes 0/1/2 of the segment each read one int32 word of scales,
+    // then all three words are broadcast to the full 16-lane segment.
+    // scales is uint16_t[6]; word0=scales[0,1], word1=scales[2,3], word2=scales[4,5].
+    int w = 0;
+    if (seg < 3) w = ((const int *) bq4_K->scales)[seg];
+    const int w0 = __shfl_sync(0xFFFFFFFF, w, 0, 16);
+    const int w1 = __shfl_sync(0xFFFFFFFF, w, 1, 16);
+    const int w2 = __shfl_sync(0xFFFFFFFF, w, 2, 16);
+
+    // Reconstruct the three uint16 scale values the original needed.
+    // jm in {0,1}; shift selects the lower or upper 16 bits of each word.
+    // jm=0: s0 = w0[15:0]  = scales[0]  -> matches original scales[jm+0] with jm=0
+    // jm=1: s0 = w0[31:16] = scales[1]  -> matches original scales[jm+0] with jm=1
+    // jm=0: s2 = w1[15:0]  = scales[2]  -> matches original scales[jm+2] with jm=0
+    // jm=1: s2 = w1[31:16] = scales[3]  -> matches original scales[jm+2] with jm=1
+    // jm=0: s4 = w2[15:0]  = scales[4]  -> matches original scales[jm+4] with jm=0
+    // jm=1: s4 = w2[31:16] = scales[5]  -> matches original scales[jm+4] with jm=1
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+    const uint32_t s0 = (((uint32_t) w0) >> (16*jm)) & 0xffff;   // scales[jm+0]
+    const uint32_t s2 = (((uint32_t) w1) >> (16*jm)) & 0xffff;   // scales[jm+2]
+    const uint32_t s4 = (((uint32_t) w2) >> (16*jm)) & 0xffff;   // scales[jm+4]
 
     const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
 
@@ -962,8 +1042,9 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, dm4, d8);
 }
+#endif // USE_COOPERATIVE_MMVQ
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {

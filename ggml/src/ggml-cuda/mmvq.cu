@@ -729,11 +729,21 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += vec_dot_q_cuda(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    if constexpr (do_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    const block_q8_1 * y_ptr = &y[j*stride_col_y + kby];
+                    const int          x_idx = kbx_offset + i*stride_row_x + kbx;
+#ifdef USE_COOPERATIVE_MMVQ
+                    if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 1) {
+                        tmp[j][i] += vec_dot_q4_K_q8_1_coop(vx, y_ptr, x_idx, kqs);
+                        if constexpr (do_gate) {
+                            tmp_gate[j][i] += vec_dot_q4_K_q8_1_coop(vgate, y_ptr, x_idx, kqs);
+                        }
+                    } else
+#endif
+                    {
+                        tmp[j][i] += vec_dot_q_cuda(vx, y_ptr, x_idx, kqs);
+                        if constexpr (do_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_ptr, x_idx, kqs);
+                        }
                     }
                 }
             }
