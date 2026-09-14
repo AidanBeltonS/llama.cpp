@@ -696,46 +696,58 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    // Hoist the runtime use_gate check out of the k-loop. The tag keeps do_gate
+    // compile-time, so the gate dot is unconditional and its weight load overlaps
+    // the vx load instead of being serialized behind a per-iteration branch.
+    const auto run_kloop = [&](auto gate_tag) {
+        constexpr bool do_gate = decltype(gate_tag)::value;
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-        // start the next iterations' weight loads early
-        if constexpr (mmvq_should_prefetch(type)) {
-            constexpr int pf_dist = 2; // loop iterations, not blocks
-            const int kbx_pf = kbx + pf_dist*blocks_per_iter;
-            if (kbx_pf < blocks_per_row_x) {
+            // start the next iterations' weight loads early
+            if constexpr (mmvq_should_prefetch(type)) {
+                constexpr int pf_dist = 2; // loop iterations, not blocks
+                const int kbx_pf = kbx + pf_dist*blocks_per_iter;
+                if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                        mmvq_prefetch_l2((const char *) vx + off);
+                        if constexpr (do_gate) {
                             mmvq_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
             }
-        }
 #endif
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (do_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
         }
+    };
+
+    if constexpr (has_fusion) {
+        if (use_gate) {
+            run_kloop(std::true_type{});
+        } else {
+            run_kloop(std::false_type{});
+        }
+    } else {
+        run_kloop(std::false_type{});
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
