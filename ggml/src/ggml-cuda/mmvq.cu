@@ -714,33 +714,58 @@ static __global__ void mul_mat_vec_q(
         constexpr int n_groups        = (nwarps*warp_size) / lanes_per_block;
         constexpr int b128_per_block  = sizeof(block_q4_K) / 16;  // 9 x int4
 
-        __shared__ __align__(16) block_q4_K x_stage[n_groups];
+        // Double-buffered staging: while a block is consumed from one buffer the
+        // next block's 128-bit loads are already in flight into the other. The two
+        // buffers let a single per-iteration barrier cover both the read-after-write
+        // on the block being consumed and the write-after-read on the block being
+        // refilled, halving the barrier count versus the single-buffer path.
+        __shared__ __align__(16) block_q4_K x_stage[2][n_groups];
 
-        const int g = tid / lanes_per_block;   // group id
-        const int l = tid % lanes_per_block;   // lane within the group
-        const int kqs = vdr * l;               // == vdr * (tid % (qi/vdr))
+        const int  g      = tid / lanes_per_block;   // group id
+        const int  l      = tid % lanes_per_block;   // lane within the group
+        const int  kqs    = vdr * l;                 // == vdr * (tid % (qi/vdr))
+        const bool loader = l < b128_per_block;      // lanes that copy the block
 
         // Uniform trip count across all threads so the in-loop __syncthreads() is
         // always reached by every thread (blocks_per_row_x need not be a multiple
         // of blocks_per_iter).
         const int n_iter = (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
 
-        for (int it = 0; it < n_iter; ++it) {
-            const int  kbx    = g + it*blocks_per_iter;
-            const bool active = kbx < blocks_per_row_x;
-            const int  kby    = active ? kbx * (qk/QK8_1) : 0;
-
-            // Cooperative 128-bit copy of the block into LDS (9 lanes, 16 B each).
-            if (active && l < b128_per_block) {
+        // Issue this group's 128-bit load for the block owned on iteration it_x.
+        // Returns garbage on non-loader / out-of-range lanes (never stored).
+        auto load_quad = [&](int it_x) -> int4 {
+            const int kbx = g + it_x*blocks_per_iter;
+            if (loader && kbx < blocks_per_row_x) {
                 const block_q4_K * xb = (const block_q4_K *) vx + (kbx_offset + kbx);
-                reinterpret_cast<int4 *>(&x_stage[g])[l] = reinterpret_cast<const int4 *>(xb)[l];
+                return reinterpret_cast<const int4 *>(xb)[l];
             }
+            return make_int4(0, 0, 0, 0);
+        };
+
+        // Prologue: stage the first block into buffer 0.
+        {
+            const int4 q0 = load_quad(0);
+            if (loader && g < blocks_per_row_x) {
+                reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
+            }
+        }
+
+        for (int it = 0; it < n_iter; ++it) {
+            const int cur = it & 1;
+
+            // Kick off the next block's global loads up front so they overlap both
+            // the barrier wait and the dot product below.
+            const bool have_next = it + 1 < n_iter;
+            const int4 q_next     = have_next ? load_quad(it + 1) : make_int4(0, 0, 0, 0);
+
             __syncthreads();
 
-            if (active) {
+            const int kbx = g + it*blocks_per_iter;
+            if (kbx < blocks_per_row_x) {
+                const int kby = kbx * (qk/QK8_1);
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[j][0] += vec_dot_q4_K_q8_1_lds(&x_stage[g], &y[j*stride_col_y + kby], kqs);
+                    tmp[j][0] += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g], &y[j*stride_col_y + kby], kqs);
                     if constexpr (has_fusion) {
                         if (use_gate) {
                             tmp_gate[j][0] += vec_dot_q_cuda(
@@ -749,7 +774,13 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            __syncthreads();
+
+            // Land the prefetched quad in the alternate buffer for the next pass.
+            // Safe without a second barrier: this buffer was last read by the
+            // previous iteration's dot, before this pass's __syncthreads() above.
+            if (have_next && loader && (g + (it + 1)*blocks_per_iter) < blocks_per_row_x) {
+                reinterpret_cast<int4 *>(&x_stage[cur ^ 1][g])[l] = q_next;
+            }
         }
     } else {
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
