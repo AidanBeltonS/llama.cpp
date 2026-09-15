@@ -787,11 +787,14 @@ static __global__ void mul_mat_vec_q(
 
             // Wave-scoped LDS ordering instead of a workgroup barrier. Each group's
             // 16 lanes are wave-contained (static_assert above), so this wave is the
-            // only producer/consumer of x_stage[*][g]; we just need this wave's
-            // staging stores to have landed in LDS (a dscnt drain) before the dot
-            // reads them, not an 8-wave rendezvous. Dropping the s_barrier restores
-            // the cross-wave memory-level parallelism the barrier serialized away.
-            __threadfence_block();
+            // only producer/consumer of x_stage[*][g]; we only need this wave's
+            // staging stores to have landed in LDS before the dot reads them, not an
+            // 8-wave rendezvous. A bare dscnt wait is used rather than
+            // __threadfence_block(): the latter also drains loadcnt and issues a
+            // global_inv, which sinks the in-flight 128-bit weight prefetch below and
+            // exposes its latency instead of overlapping it with the dot product.
+            // TODO: investigate __builtin_amdgcn_s_wait_dscnt(0) as a typed alternative.
+            asm volatile("s_wait_dscnt 0" ::: "memory");
 
             const int kbx = g + it*blocks_per_iter;
             if (kbx < blocks_per_row_x) {
