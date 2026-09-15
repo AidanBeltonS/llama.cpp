@@ -696,6 +696,62 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+    // On RDNA4 the Q4_K weight block is loaded cooperatively into LDS with 128-bit
+    // loads (see below); every other arch/type keeps the original per-lane loop.
+#if defined(RDNA4)
+    // On RDNA4 rows_per_cuda_block is always 1 and small_k is always false, so the
+    // staging path (which assumes one weight block per group) covers the token-gen
+    // path (ncols_dst == 1). Fall back to the original loop otherwise.
+    constexpr bool use_lds_stage = (type == GGML_TYPE_Q4_K) && (ncols_dst == 1) && (rows_per_cuda_block == 1);
+#else
+    constexpr bool use_lds_stage = false;
+#endif // defined(RDNA4)
+
+    if constexpr (use_lds_stage) {
+        // A group of (qi/vdr) lanes owns one 144-byte Q4_K block. On RDNA4
+        // rows_per_cuda_block == 1, so a group stages a single block per iteration.
+        constexpr int lanes_per_block = qi / vdr;                 // 16 for Q4_K
+        constexpr int n_groups        = (nwarps*warp_size) / lanes_per_block;
+        constexpr int b128_per_block  = sizeof(block_q4_K) / 16;  // 9 x int4
+
+        __shared__ __align__(16) block_q4_K x_stage[n_groups];
+
+        const int g = tid / lanes_per_block;   // group id
+        const int l = tid % lanes_per_block;   // lane within the group
+        const int kqs = vdr * l;               // == vdr * (tid % (qi/vdr))
+
+        // Uniform trip count across all threads so the in-loop __syncthreads() is
+        // always reached by every thread (blocks_per_row_x need not be a multiple
+        // of blocks_per_iter).
+        const int n_iter = (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
+
+        for (int it = 0; it < n_iter; ++it) {
+            const int  kbx    = g + it*blocks_per_iter;
+            const bool active = kbx < blocks_per_row_x;
+            const int  kby    = active ? kbx * (qk/QK8_1) : 0;
+
+            // Cooperative 128-bit copy of the block into LDS (9 lanes, 16 B each).
+            if (active && l < b128_per_block) {
+                const block_q4_K * xb = (const block_q4_K *) vx + (kbx_offset + kbx);
+                reinterpret_cast<int4 *>(&x_stage[g])[l] = reinterpret_cast<const int4 *>(xb)[l];
+            }
+            __syncthreads();
+
+            if (active) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][0] += vec_dot_q4_K_q8_1_lds(&x_stage[g], &y[j*stride_col_y + kby], kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][0] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    } else {
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -736,6 +792,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
         }
+    }
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
