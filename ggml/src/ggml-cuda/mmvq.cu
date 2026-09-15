@@ -772,16 +772,20 @@ static __global__ void mul_mat_vec_q(
         };
 
         // Prologue: stage the first block (x and, when fused, gate) into buffer 0.
-        {
+        if (fused) {
             const int4 q0 = load_quad(0);
             const int4 g0 = fused ? load_gate_quad(0) : make_int4(0, 0, 0, 0);
             if (loader && g < blocks_per_row_x) {
                 reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
-                if (fused) {
-                    reinterpret_cast<int4 *>(&gate_stage[0][g])[l] = g0;
-                }
+                reinterpret_cast<int4 *>(&gate_stage[0][g])[l] = g0;
             }
-        }
+        } else {
+            const int4 q0 = load_quad(0);
+            const int4 g0 = fused ? load_gate_quad(0) : make_int4(0, 0, 0, 0);
+            if (loader && g < blocks_per_row_x) {
+                reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
+            }
+	}
 
         for (int it = 0; it < n_iter; ++it) {
             const int cur = it & 1;
