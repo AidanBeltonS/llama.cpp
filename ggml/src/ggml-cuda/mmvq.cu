@@ -725,13 +725,17 @@ static __global__ void mul_mat_vec_q(
         // next block's 128-bit loads are already in flight into the other. The two
         // buffers let a single per-iteration LDS fence cover both the read-after-write
         // on the block being consumed and the write-after-read on the block being
-        // refilled, halving the sync count versus the single-buffer path.
+        // refilled, halving the sync count versus the single-buffer path. The fused
+        // gate weight (same Q4_K layout as vx) is staged the same way in gate_stage.
         __shared__ __align__(16) block_q4_K x_stage[2][n_groups];
+        [[maybe_unused]] __shared__ __align__(16) block_q4_K gate_stage[has_fusion ? 2 : 1][n_groups];
 
         const int  g      = tid / lanes_per_block;   // group id
         const int  l      = tid % lanes_per_block;   // lane within the group
         const int  kqs    = vdr * l;                 // == vdr * (tid % (qi/vdr))
         const bool loader = l < b128_per_block;      // lanes that copy the block
+        // Whether the fused gate weight is present; when so it is staged alongside x.
+        const bool fused  = has_fusion && use_gate;
 
         // Uniform trip count across all threads so control flow stays uniform within
         // each wave around the in-loop LDS fence (blocks_per_row_x need not be a
@@ -749,11 +753,26 @@ static __global__ void mul_mat_vec_q(
             return make_int4(0, 0, 0, 0);
         };
 
-        // Prologue: stage the first block into buffer 0.
+        // Same cooperative 128-bit load for the fused gate block. Reuses the 9 x
+        // loader lanes, so each loader issues its x quad and its gate quad together.
+        auto load_gate_quad = [&](int it_x) -> int4 {
+            const int kbx = g + it_x*blocks_per_iter;
+            if (loader && kbx < blocks_per_row_x) {
+                const block_q4_K * gb = (const block_q4_K *) vgate + (kbx_offset + kbx);
+                return reinterpret_cast<const int4 *>(gb)[l];
+            }
+            return make_int4(0, 0, 0, 0);
+        };
+
+        // Prologue: stage the first block (x and, when fused, gate) into buffer 0.
         {
             const int4 q0 = load_quad(0);
+            const int4 g0 = fused ? load_gate_quad(0) : make_int4(0, 0, 0, 0);
             if (loader && g < blocks_per_row_x) {
                 reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
+                if (fused) {
+                    reinterpret_cast<int4 *>(&gate_stage[0][g])[l] = g0;
+                }
             }
         }
 
@@ -764,6 +783,7 @@ static __global__ void mul_mat_vec_q(
             // the LDS fence and the dot product below.
             const bool have_next = it + 1 < n_iter;
             const int4 q_next     = have_next ? load_quad(it + 1) : make_int4(0, 0, 0, 0);
+            const int4 gq_next    = (fused && have_next) ? load_gate_quad(it + 1) : make_int4(0, 0, 0, 0);
 
             // Wave-scoped LDS ordering instead of a workgroup barrier. Each group's
             // 16 lanes are wave-contained (static_assert above), so this wave is the
@@ -776,16 +796,14 @@ static __global__ void mul_mat_vec_q(
             const int kbx = g + it*blocks_per_iter;
             if (kbx < blocks_per_row_x) {
                 const int kby = kbx * (qk/QK8_1);
-                // Hoist the runtime use_gate test out of the dot loop: with no branch
-                // sitting between the x and gate dots, the two vec_dot streams can
-                // interleave and overlap their loads. has_fusion is a compile-time
-                // constant, so the gate loop is elided entirely for non-fused kernels.
-                const bool fused = has_fusion && use_gate;
+                // use_gate is hoisted out of the dot loop (see fused above) so the x
+                // and gate dots interleave without a branch between them; both weights
+                // now come straight from LDS.
                 if (fused) {
 #pragma unroll
                     for (int j = 0; j < ncols_dst; ++j) {
-                        tmp[j][0]      += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g], &y[j*stride_col_y + kby], kqs);
-                        tmp_gate[j][0] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+                        tmp[j][0]      += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g],    &y[j*stride_col_y + kby], kqs);
+                        tmp_gate[j][0] += vec_dot_q4_K_q8_1_lds(&gate_stage[cur][g], &y[j*stride_col_y + kby], kqs);
                     }
                 } else {
 #pragma unroll
@@ -795,12 +813,15 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            // Land the prefetched quad in the alternate buffer for the next pass.
+            // Land the prefetched quads in the alternate buffers for the next pass.
             // Safe without a second fence: within this wave the previous iteration's
-            // dot already consumed this buffer (its LDS reads feed the VALU that
-            // produced tmp), so the write-after-read is satisfied by program order.
+            // dot already consumed these buffers (its LDS reads feed the VALU that
+            // produced tmp/tmp_gate), so the write-after-read is satisfied by order.
             if (have_next && loader && (g + (it + 1)*blocks_per_iter) < blocks_per_row_x) {
                 reinterpret_cast<int4 *>(&x_stage[cur ^ 1][g])[l] = q_next;
+                if (fused) {
+                    reinterpret_cast<int4 *>(&gate_stage[cur ^ 1][g])[l] = gq_next;
+                }
             }
         }
     } else {
