@@ -714,11 +714,18 @@ static __global__ void mul_mat_vec_q(
         constexpr int n_groups        = (nwarps*warp_size) / lanes_per_block;
         constexpr int b128_per_block  = sizeof(block_q4_K) / 16;  // 9 x int4
 
+        // The wave-scoped LDS ordering below (a __threadfence_block instead of a
+        // full workgroup barrier) is only correct if each group's lanes_per_block
+        // lanes live entirely within one wave: a group is then the sole producer
+        // and consumer of x_stage[*][g], so no cross-wave synchronization is needed.
+        static_assert(!use_lds_stage || warp_size % lanes_per_block == 0,
+            "Q4_K LDS staging requires each group to be contained within a single wave");
+
         // Double-buffered staging: while a block is consumed from one buffer the
         // next block's 128-bit loads are already in flight into the other. The two
-        // buffers let a single per-iteration barrier cover both the read-after-write
+        // buffers let a single per-iteration LDS fence cover both the read-after-write
         // on the block being consumed and the write-after-read on the block being
-        // refilled, halving the barrier count versus the single-buffer path.
+        // refilled, halving the sync count versus the single-buffer path.
         __shared__ __align__(16) block_q4_K x_stage[2][n_groups];
 
         const int  g      = tid / lanes_per_block;   // group id
@@ -726,9 +733,9 @@ static __global__ void mul_mat_vec_q(
         const int  kqs    = vdr * l;                 // == vdr * (tid % (qi/vdr))
         const bool loader = l < b128_per_block;      // lanes that copy the block
 
-        // Uniform trip count across all threads so the in-loop __syncthreads() is
-        // always reached by every thread (blocks_per_row_x need not be a multiple
-        // of blocks_per_iter).
+        // Uniform trip count across all threads so control flow stays uniform within
+        // each wave around the in-loop LDS fence (blocks_per_row_x need not be a
+        // multiple of blocks_per_iter).
         const int n_iter = (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
 
         // Issue this group's 128-bit load for the block owned on iteration it_x.
@@ -754,11 +761,17 @@ static __global__ void mul_mat_vec_q(
             const int cur = it & 1;
 
             // Kick off the next block's global loads up front so they overlap both
-            // the barrier wait and the dot product below.
+            // the LDS fence and the dot product below.
             const bool have_next = it + 1 < n_iter;
             const int4 q_next     = have_next ? load_quad(it + 1) : make_int4(0, 0, 0, 0);
 
-            __syncthreads();
+            // Wave-scoped LDS ordering instead of a workgroup barrier. Each group's
+            // 16 lanes are wave-contained (static_assert above), so this wave is the
+            // only producer/consumer of x_stage[*][g]; we just need this wave's
+            // staging stores to have landed in LDS (a dscnt drain) before the dot
+            // reads them, not an 8-wave rendezvous. Dropping the s_barrier restores
+            // the cross-wave memory-level parallelism the barrier serialized away.
+            __threadfence_block();
 
             const int kbx = g + it*blocks_per_iter;
             if (kbx < blocks_per_row_x) {
@@ -776,8 +789,9 @@ static __global__ void mul_mat_vec_q(
             }
 
             // Land the prefetched quad in the alternate buffer for the next pass.
-            // Safe without a second barrier: this buffer was last read by the
-            // previous iteration's dot, before this pass's __syncthreads() above.
+            // Safe without a second fence: within this wave the previous iteration's
+            // dot already consumed this buffer (its LDS reads feed the VALU that
+            // produced tmp), so the write-after-read is satisfied by program order.
             if (have_next && loader && (g + (it + 1)*blocks_per_iter) < blocks_per_row_x) {
                 reinterpret_cast<int4 *>(&x_stage[cur ^ 1][g])[l] = q_next;
             }
