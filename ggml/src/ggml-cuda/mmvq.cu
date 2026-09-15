@@ -6,6 +6,16 @@
 #include <cstdint>
 #include <type_traits>
 
+// 128-bit staging vector for the RDNA4 Q4_K path below. On HIP this is a native clang vector, so the
+// width is part of the type; int4 is a class with four scalar members and relies on the vectorizer.
+#if defined(GGML_USE_HIP)
+typedef int mmvq_i32x4 __attribute__((ext_vector_type(4)));
+static __device__ __forceinline__ mmvq_i32x4 mmvq_i32x4_zero() { return mmvq_i32x4(0); }
+#else
+typedef int4 mmvq_i32x4;
+static __device__ __forceinline__ mmvq_i32x4 mmvq_i32x4_zero() { return make_int4(0, 0, 0, 0); }
+#endif
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
@@ -719,7 +729,7 @@ static __global__ void mul_mat_vec_q(
         // rows_per_cuda_block == 1, so a group stages a single block per iteration.
         constexpr int lanes_per_block = qi / vdr;                 // 16 for Q4_K
         constexpr int n_groups        = (nwarps*warp_size) / lanes_per_block;
-        constexpr int b128_per_block  = sizeof(block_q4_K) / 16;  // 9 x int4
+        constexpr int b128_per_block  = sizeof(block_q4_K) / 16;  // 9 x mmvq_i32x4
 
         // The wave-scoped LDS ordering below (a __threadfence_block instead of a
         // full workgroup barrier) is only correct if each group's lanes_per_block
@@ -751,39 +761,39 @@ static __global__ void mul_mat_vec_q(
 
         // Issue this group's 128-bit load for the block owned on iteration it_x.
         // Returns garbage on non-loader / out-of-range lanes (never stored).
-        auto load_quad = [&](int it_x) -> int4 {
+        auto load_quad = [&](int it_x) -> mmvq_i32x4 {
             const int kbx = g + it_x*blocks_per_iter;
             if (loader && kbx < blocks_per_row_x) {
                 const block_q4_K * xb = (const block_q4_K *) vx + (kbx_offset + kbx);
-                return reinterpret_cast<const int4 *>(xb)[l];
+                return reinterpret_cast<const mmvq_i32x4 *>(xb)[l];
             }
-            return make_int4(0, 0, 0, 0);
+            return mmvq_i32x4_zero();
         };
 
         // Same cooperative 128-bit load for the fused gate block. Reuses the 9 x
         // loader lanes, so each loader issues its x quad and its gate quad together.
-        auto load_gate_quad = [&](int it_x) -> int4 {
+        auto load_gate_quad = [&](int it_x) -> mmvq_i32x4 {
             const int kbx = g + it_x*blocks_per_iter;
             if (loader && kbx < blocks_per_row_x) {
                 const block_q4_K * gb = (const block_q4_K *) vgate + (kbx_offset + kbx);
-                return reinterpret_cast<const int4 *>(gb)[l];
+                return reinterpret_cast<const mmvq_i32x4 *>(gb)[l];
             }
-            return make_int4(0, 0, 0, 0);
+            return mmvq_i32x4_zero();
         };
 
         // Prologue: stage the first block (x and, when fused, gate) into buffer 0.
         if (fused) {
-            const int4 q0 = load_quad(0);
-            const int4 g0 = fused ? load_gate_quad(0) : make_int4(0, 0, 0, 0);
+            const mmvq_i32x4 q0 = load_quad(0);
+            const mmvq_i32x4 g0 = fused ? load_gate_quad(0) : mmvq_i32x4_zero();
             if (loader && g < blocks_per_row_x) {
-                reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
-                reinterpret_cast<int4 *>(&gate_stage[0][g])[l] = g0;
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[0][g])[l] = q0;
+                reinterpret_cast<mmvq_i32x4 *>(&gate_stage[0][g])[l] = g0;
             }
         } else {
-            const int4 q0 = load_quad(0);
-            const int4 g0 = fused ? load_gate_quad(0) : make_int4(0, 0, 0, 0);
+            const mmvq_i32x4 q0 = load_quad(0);
+            const mmvq_i32x4 g0 = fused ? load_gate_quad(0) : mmvq_i32x4_zero();
             if (loader && g < blocks_per_row_x) {
-                reinterpret_cast<int4 *>(&x_stage[0][g])[l] = q0;
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[0][g])[l] = q0;
             }
 	}
 
@@ -793,8 +803,8 @@ static __global__ void mul_mat_vec_q(
             // Kick off the next block's global loads up front so they overlap both
             // the LDS fence and the dot product below.
             const bool have_next = it + 1 < n_iter;
-            const int4 q_next     = have_next ? load_quad(it + 1) : make_int4(0, 0, 0, 0);
-            const int4 gq_next    = (fused && have_next) ? load_gate_quad(it + 1) : make_int4(0, 0, 0, 0);
+            const mmvq_i32x4 q_next  = have_next ? load_quad(it + 1) : mmvq_i32x4_zero();
+            const mmvq_i32x4 gq_next = (fused && have_next) ? load_gate_quad(it + 1) : mmvq_i32x4_zero();
 
             // Wave-scoped LDS ordering instead of a workgroup barrier. Each group's
             // 16 lanes are wave-contained (static_assert above), so this wave is the
@@ -832,9 +842,9 @@ static __global__ void mul_mat_vec_q(
             // dot already consumed these buffers (its LDS reads feed the VALU that
             // produced tmp/tmp_gate), so the write-after-read is satisfied by order.
             if (have_next && loader && (g + (it + 1)*blocks_per_iter) < blocks_per_row_x) {
-                reinterpret_cast<int4 *>(&x_stage[cur ^ 1][g])[l] = q_next;
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[cur ^ 1][g])[l] = q_next;
                 if (fused) {
-                    reinterpret_cast<int4 *>(&gate_stage[cur ^ 1][g])[l] = gq_next;
+                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[cur ^ 1][g])[l] = gq_next;
                 }
             }
         }
