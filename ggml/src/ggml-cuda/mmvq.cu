@@ -776,14 +776,21 @@ static __global__ void mul_mat_vec_q(
             const int kbx = g + it*blocks_per_iter;
             if (kbx < blocks_per_row_x) {
                 const int kby = kbx * (qk/QK8_1);
+                // Hoist the runtime use_gate test out of the dot loop: with no branch
+                // sitting between the x and gate dots, the two vec_dot streams can
+                // interleave and overlap their loads. has_fusion is a compile-time
+                // constant, so the gate loop is elided entirely for non-fused kernels.
+                const bool fused = has_fusion && use_gate;
+                if (fused) {
 #pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[j][0] += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g], &y[j*stride_col_y + kby], kqs);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            tmp_gate[j][0] += vec_dot_q_cuda(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
-                        }
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        tmp[j][0]      += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g], &y[j*stride_col_y + kby], kqs);
+                        tmp_gate[j][0] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_offset + kbx, kqs);
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        tmp[j][0] += vec_dot_q4_K_q8_1_lds(&x_stage[cur][g], &y[j*stride_col_y + kby], kqs);
                     }
                 }
             }
@@ -823,17 +830,25 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+        // Hoist the runtime use_gate test out of the dot loops so the x and gate
+        // vec_dot streams interleave without a branch between them. has_fusion is a
+        // compile-time constant, so the gate loop is elided for non-fused kernels.
+        const bool fused = has_fusion && use_gate;
+        if (fused) {
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    }
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i]      += vec_dot_q_cuda(vx,    &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 }
             }
         }
