@@ -1602,25 +1602,37 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // whole-graph cases (fusion) have to repeat every node, else the repetitions would only
+        // re-run the last op and the fused kernel would be a vanishing fraction of the measurement
+        const int  n_nodes_base = ggml_graph_n_nodes(gf);
+        const bool repeat_graph = run_whole_graph();
+        const int64_t max_runs = repeat_graph ?
+            ggml_graph_size(gf) / n_nodes_base - 1 : ggml_graph_size(gf) - n_nodes_base;
         if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
             const uint64_t target_flops_gpu = 100ULL * GFLOP;
             uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            n_runs = (int)std::min<int64_t>(max_runs, target_flops / op_flops(out)) + 1;
         } else {
             // based on memory size
             const size_t GB = 1ULL << 30;
             const size_t target_size_cpu =  8 * GB;
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+            n_runs = (int)std::min<int64_t>(max_runs, target_size / op_size(out)) + 1;
         }
 
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+            if (repeat_graph) {
+                for (int j = 0; j < n_nodes_base; j++) {
+                    ggml_graph_add_node(gf, ggml_graph_node(gf, j));
+                }
+            } else {
+                ggml_graph_add_node(gf, out);
+            }
         }
 
         // calculate memory
@@ -11117,6 +11129,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+
+    // qwen3.5-27b, n_embd=5120, n_ff=17408, 65 hybrid blocks (17 attention, 48 gated delta net)
+    // Q4_K_M puts some of ffn_down/attn_qkv/attn_v and the output head in Q6_K, the rest in Q4_K
+    for (int bs : {1, 2, 4, 8}) {
+        // fused [ffn_gate|ffn_up] + SwiGLU
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, bs, 17408, 5120,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, bs, 17408, {1, 1}, {1, 1})); // ffn_down
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs,  5120, {1, 1}, {1, 1})); // attn_qkv
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  1024, bs,  5120, {1, 1}, {1, 1})); // attn_k, attn_v
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  12288, bs,  5120, {1, 1}, {1, 1})); // attn_q
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   6144, bs,  5120, {1, 1}, {1, 1})); // attn_gate
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   5120, bs,  6144, {1, 1}, {1, 1})); // attn_output, ssm_out
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,     48, bs,  5120, {1, 1}, {1, 1})); // ssm_alpha, ssm_beta
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, bs,  5120, {1, 1}, {1, 1})); // output head
     }
 
     // qwen3-30b-a3b
