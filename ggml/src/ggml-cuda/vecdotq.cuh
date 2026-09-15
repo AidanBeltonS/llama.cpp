@@ -973,12 +973,25 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 // Within a warp, 16 lanes share one Q4_K block (VDR_Q4_K_Q8_1_MMVQ=2 -> QI4_K/vdr=16 lanes/block).
 // The block's dm (half2) and scales (uint16_t[6]) are redundantly loaded by the original path.
 // Here: dm is loaded by seg-lane 0 and broadcast; scales are loaded as 3 int32 words by
-// seg-lanes 0/1/2 and broadcast — all via __shfl_sync(mask=0xFFFFFFFF, ..., srcLane, width=16).
-// width=16 segments the warp into independent {0..15},{16..31} groups; srcLane is relative to
-// the segment start. On HIP, __shfl_sync is redefined to __shfl (mask dropped), so 0xFFFFFFFF
-// is the correct repo-wide convention and is safe on both CUDA and HIP/wave64.
+// seg-lanes 0/1/2 and broadcast — all via coop_bcast16 (v_permlane16 on RDNA4, shuffle else).
+// The broadcast segments the warp into independent {0..15},{16..31} groups; srcLane is relative
+// to the segment start and all 16 lanes of a segment share kbx, so the broadcast is safe.
 // qs (weights) and the q8/activation-side loads are NOT cooperative — unchanged from original.
 #ifdef USE_COOPERATIVE_MMVQ
+// Broadcast lane srcLane of each 16-lane segment to all 16 lanes.
+// On RDNA4 (wave32) this is one VALU v_permlane16_b32: no LDS crossbar and no
+// ds_bpermute, so it does not force an s_wait_loadcnt drain on the segment's
+// load the way a shuffle does. CUDA and CDNA have no permlane16 -> shuffle.
+template <int srcLane>
+static __device__ __forceinline__ int coop_bcast16(int x) {
+#if defined(RDNA4)
+    constexpr uint32_t sel = (uint32_t) srcLane * 0x11111111u; // pick srcLane in every 4-bit lane field
+    return (int) __builtin_amdgcn_permlane16((uint32_t) x, (uint32_t) x, sel, sel, false, false);
+#else
+    return __shfl_sync(0xFFFFFFFF, x, srcLane, 16);
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -998,7 +1011,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
     const int seg = threadIdx.x & 15;   // lane within the 16-lane segment
     int dm_i = 0;
     if (seg == 0) dm_i = *(const int *) &bq4_K->dm;
-    dm_i = __shfl_sync(0xFFFFFFFF, dm_i, 0, 16);
+    dm_i = coop_bcast16<0>(dm_i);
     half2 dm4;
     memcpy(&dm4, &dm_i, sizeof(dm4));   // bit-preserving int32 -> half2 (do NOT numerically convert)
 
@@ -1007,9 +1020,9 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
     // scales is uint16_t[6]; word0=scales[0,1], word1=scales[2,3], word2=scales[4,5].
     int w = 0;
     if (seg < 3) w = ((const int *) bq4_K->scales)[seg];
-    const int w0 = __shfl_sync(0xFFFFFFFF, w, 0, 16);
-    const int w1 = __shfl_sync(0xFFFFFFFF, w, 1, 16);
-    const int w2 = __shfl_sync(0xFFFFFFFF, w, 2, 16);
+    const int w0 = coop_bcast16<0>(w);
+    const int w1 = coop_bcast16<1>(w);
+    const int w2 = coop_bcast16<2>(w);
 
     // Reconstruct the three uint16 scale values the original needed.
     // jm in {0,1}; shift selects the lower or upper 16 bits of each word.
