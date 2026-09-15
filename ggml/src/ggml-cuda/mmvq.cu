@@ -707,7 +707,14 @@ static __global__ void mul_mat_vec_q(
     constexpr bool use_lds_stage = false;
 #endif // defined(RDNA4)
 
+    // B1: the LDS staging pipeline only pays off when the block loop runs more than
+    // once (n_iter > 1, i.e. blocks_per_row_x > blocks_per_iter) so one block's weight
+    // loads overlap another block's dot. At n_iter == 1 (e.g. ncols_x == 4096 -> 16
+    // blocks == one iteration) there is nothing to overlap and the global->LDS->reg
+    // round-trip is pure added latency, so fall back to the per-lane loop below.
+    bool did_staging = false;
     if constexpr (use_lds_stage) {
+      if (blocks_per_row_x > blocks_per_iter) {
         // A group of (qi/vdr) lanes owns one 144-byte Q4_K block. On RDNA4
         // rows_per_cuda_block == 1, so a group stages a single block per iteration.
         constexpr int lanes_per_block = qi / vdr;                 // 16 for Q4_K
@@ -827,7 +834,10 @@ static __global__ void mul_mat_vec_q(
                 }
             }
         }
-    } else {
+        did_staging = true;
+      }
+    }
+    if (!did_staging) {
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
