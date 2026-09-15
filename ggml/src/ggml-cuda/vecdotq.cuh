@@ -992,8 +992,31 @@ static __device__ __forceinline__ int coop_bcast16(int x) {
 #endif
 }
 
+// Prefetched cooperative fields for one Q4_K block: the per-lane raw loads that
+// feed the segment broadcast. Only seg-lane 0 holds dm_i; seg-lanes 0/1/2 hold w.
+struct q4k_coop_pf {
+    int dm_i;   // raw 32 bits of bq4_K->dm, valid on seg-lane 0
+    int w;      // one 32-bit scales word, valid on seg-lanes 0/1/2
+};
+
+// Issue the cooperative (redundant) dm + scales loads for block kbx. Kept apart
+// from the dot so the k-loop can start these one iteration early: with the loads
+// in flight during the previous block's dot, the broadcast below no longer waits.
+static __device__ __forceinline__ q4k_coop_pf q4k_coop_load(const void * __restrict__ vbq, const int kbx) {
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+    const int seg = threadIdx.x & 15;   // lane within the 16-lane segment
+
+    q4k_coop_pf pf;
+    pf.dm_i = 0;
+    if (seg == 0) pf.dm_i = *(const int *) &bq4_K->dm;
+    pf.w = 0;
+    if (seg < 3) pf.w = ((const int *) bq4_K->scales)[seg];
+    return pf;
+}
+
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const q4k_coop_pf & pf) {
 
     const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
 
@@ -1007,22 +1030,16 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_coop(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    // Cooperative dm load: lane 0 of the 16-lane segment reads dm, broadcasts to the segment.
-    const int seg = threadIdx.x & 15;   // lane within the 16-lane segment
-    int dm_i = 0;
-    if (seg == 0) dm_i = *(const int *) &bq4_K->dm;
-    dm_i = coop_bcast16<0>(dm_i);
+    // Broadcast the prefetched dm (loaded by seg-lane 0) to the whole 16-lane segment.
+    int dm_i = coop_bcast16<0>(pf.dm_i);
     half2 dm4;
     memcpy(&dm4, &dm_i, sizeof(dm4));   // bit-preserving int32 -> half2 (do NOT numerically convert)
 
-    // Cooperative scales load: lanes 0/1/2 of the segment each read one int32 word of scales,
-    // then all three words are broadcast to the full 16-lane segment.
+    // Broadcast the three prefetched scale words (loaded by seg-lanes 0/1/2).
     // scales is uint16_t[6]; word0=scales[0,1], word1=scales[2,3], word2=scales[4,5].
-    int w = 0;
-    if (seg < 3) w = ((const int *) bq4_K->scales)[seg];
-    const int w0 = coop_bcast16<0>(w);
-    const int w1 = coop_bcast16<1>(w);
-    const int w2 = coop_bcast16<2>(w);
+    const int w0 = coop_bcast16<0>(pf.w);
+    const int w1 = coop_bcast16<1>(pf.w);
+    const int w2 = coop_bcast16<2>(pf.w);
 
     // Reconstruct the three uint16 scale values the original needed.
     // jm in {0,1}; shift selects the lower or upper 16 bits of each word.

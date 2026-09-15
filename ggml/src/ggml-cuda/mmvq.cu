@@ -701,6 +701,68 @@ static __global__ void mul_mat_vec_q(
     // the vx load instead of being serialized behind a per-iteration branch.
     const auto run_kloop = [&](auto gate_tag) {
         constexpr bool do_gate = decltype(gate_tag)::value;
+
+#ifdef USE_COOPERATIVE_MMVQ
+        if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 1) {
+            // Software-pipelined coop path: start each block's cooperative dm/scales
+            // loads one k-iteration early. With the loads in flight during the previous
+            // block's dot, the segment broadcast stops forcing an s_wait_loadcnt drain.
+            const int kqs  = vdr * (tid % (qi/vdr)); // loop-invariant
+            const int kbx0 = tid / (qi/vdr);
+
+            q4k_coop_pf pf     [rows_per_cuda_block];
+            q4k_coop_pf pf_gate[rows_per_cuda_block];
+            if (kbx0 < blocks_per_row_x) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const int x_idx = kbx_offset + i*stride_row_x + kbx0;
+                    pf[i] = q4k_coop_load(vx, x_idx);
+                    if constexpr (do_gate) {
+                        pf_gate[i] = q4k_coop_load(vgate, x_idx);
+                    }
+                }
+            }
+
+            for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby      = kbx * (qk/QK8_1);
+                const int kbx_next = kbx + blocks_per_iter;
+
+                // issue the next block's cooperative loads before consuming this one
+                q4k_coop_pf pf_next     [rows_per_cuda_block];
+                q4k_coop_pf pf_gate_next[rows_per_cuda_block];
+                if (kbx_next < blocks_per_row_x) {
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const int x_idx = kbx_offset + i*stride_row_x + kbx_next;
+                        pf_next[i] = q4k_coop_load(vx, x_idx);
+                        if constexpr (do_gate) {
+                            pf_gate_next[i] = q4k_coop_load(vgate, x_idx);
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const block_q8_1 * y_ptr = &y[kby];
+                    const int          x_idx = kbx_offset + i*stride_row_x + kbx;
+                    tmp[0][i] += vec_dot_q4_K_q8_1_coop(vx, y_ptr, x_idx, kqs, pf[i]);
+                    if constexpr (do_gate) {
+                        tmp_gate[0][i] += vec_dot_q4_K_q8_1_coop(vgate, y_ptr, x_idx, kqs, pf_gate[i]);
+                    }
+                }
+
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    pf[i] = pf_next[i];
+                    if constexpr (do_gate) {
+                        pf_gate[i] = pf_gate_next[i];
+                    }
+                }
+            }
+            return;
+        }
+#endif
+
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -731,19 +793,9 @@ static __global__ void mul_mat_vec_q(
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const block_q8_1 * y_ptr = &y[j*stride_col_y + kby];
                     const int          x_idx = kbx_offset + i*stride_row_x + kbx;
-#ifdef USE_COOPERATIVE_MMVQ
-                    if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 1) {
-                        tmp[j][i] += vec_dot_q4_K_q8_1_coop(vx, y_ptr, x_idx, kqs);
-                        if constexpr (do_gate) {
-                            tmp_gate[j][i] += vec_dot_q4_K_q8_1_coop(vgate, y_ptr, x_idx, kqs);
-                        }
-                    } else
-#endif
-                    {
-                        tmp[j][i] += vec_dot_q_cuda(vx, y_ptr, x_idx, kqs);
-                        if constexpr (do_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_ptr, x_idx, kqs);
-                        }
+                    tmp[j][i] += vec_dot_q_cuda(vx, y_ptr, x_idx, kqs);
+                    if constexpr (do_gate) {
+                        tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_ptr, x_idx, kqs);
                     }
                 }
             }
