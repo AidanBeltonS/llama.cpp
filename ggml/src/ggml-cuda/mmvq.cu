@@ -1018,6 +1018,258 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+#if defined(RDNA4)
+// Wave-scoped LDS ordering for the staging pipeline below. On RDNA4 this is a bare
+// dscnt wait: unlike __threadfence_block() it does not also drain loadcnt or issue a
+// global_inv, either of which would sink the in-flight 128-bit weight prefetch and
+// expose its latency instead of overlapping it with the dot product.
+//
+// s_wait_dscnt has no CDNA/GCN encoding, so those targets fall back to a full block
+// fence. That path exists purely so widening the guard on the kernel below to
+// `defined(RDNA4) || defined(CDNA)` -- the way RDNA4 code is correctness-tested on the
+// gfx942 dev box -- compiles and runs. The test is written positively (on CDNA/GCN)
+// rather than as a nested RDNA4 check so that widening the guard cannot disable it.
+static __device__ __forceinline__ void mmvq_rdna4_lds_wait() {
+#if defined(CDNA) || defined(GCN)
+    __threadfence_block();
+#else
+    asm volatile("s_wait_dscnt 0" ::: "memory");
+#endif
+}
+
+// A persistent, row-per-wave fork of mul_mat_vec_q, Q4_K-only, ncols_dst == 1 only.
+//
+// mul_mat_vec_q puts all nwarps waves of a workgroup on ONE output row and reduces
+// across waves through LDS with a __syncthreads(); at rows_per_cuda_block == 1 that
+// pays a large prologue/epilogue once per row. This kernel instead gives each wave
+// its OWN output row and makes the workgroup persistent: it strides through tiles of
+// nwarps rows. There is no cross-wave reduction, no tmp_shared, and no
+// __syncthreads() anywhere below. See deep_mmvq_pipeline.md for the full design.
+//
+// This is a genuine fork of mul_mat_vec_q (not a template specialization): it shares
+// the staging *idea* with the use_lds_stage block above, but the loop nest, the
+// buffer-index arithmetic, and the load/store predication are all different, so the
+// two are kept as independent code paths on purpose. Do not merge them.
+template <bool has_fusion, int stages>
+__launch_bounds__(8*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_rdna4(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr ggml_type type = GGML_TYPE_Q4_K;
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;              // 256
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;              // 32
+    constexpr int vdr = get_vdr_mmvq(type);                           // 2
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = 8;
+    constexpr int lanes_per_block = qi / vdr;                         // 16
+    // blocks_per_iter_per_wave. 2 on gfx1201 (wave32), 4 on gfx942 (wave64, dev-box
+    // correctness check only) -- this must never be hardcoded, see deep_mmvq_pipeline.md §2.2.
+    constexpr int bpi             = warp_size / lanes_per_block;
+    constexpr int n_groups        = nwarps * warp_size / lanes_per_block;
+    constexpr int b128_per_block  = sizeof(block_q4_K) / 16;          // 9
+    static_assert(warp_size % lanes_per_block == 0,
+        "Q4_K LDS staging requires each group to be contained within a single wave");
+    static_assert(sizeof(block_q4_K) % 16 == 0,
+        "block_q4_K must be a whole number of 128-bit quads for the LDS staging below");
+
+    // Thread decomposition: w indexes the row this wave owns within the tile; (gl, l)
+    // decompose the wave's lane space into bpi groups of lanes_per_block lanes each,
+    // one group per Q4_K block staged this iteration. g is that group's slot in LDS.
+    const int w   = threadIdx.y;
+    const int gl  = threadIdx.x / lanes_per_block;
+    const int l   = threadIdx.x % lanes_per_block;
+    const int g   = w*bpi + gl;
+    const int kqs = vdr * l;
+    const bool loader = l < b128_per_block;
+
+    const uint32_t channel_dst = blockIdx.y;
+
+    uint32_t channel_x;
+    uint32_t channel_y;
+    uint32_t sample_dst;
+
+    ggml_cuda_pdl_sync();
+    channel_x  = ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    channel_y  = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    sample_dst = blockIdx.z;
+
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    bool use_gate = false;
+    [[maybe_unused]] const void * vgate = nullptr;
+    const float * x_bias    = nullptr;
+    const float * gate_bias = nullptr;
+    ggml_glu_op   active_glu = GGML_GLU_OP_SWIGLU;
+    float         glu_limit  = 0.0f;
+
+    if constexpr (has_fusion) {
+        use_gate   = fusion.gate      != nullptr;
+        vgate      = fusion.gate;
+        x_bias     = (const float *) fusion.x_bias;
+        gate_bias  = (const float *) fusion.gate_bias;
+        active_glu = fusion.glu_op;
+        glu_limit  = fusion.glu_limit;
+    }
+    // Bias arrays are per-expert when ids is present (MoE), per-channel otherwise --
+    // mirrors mul_mat_vec_q's channel_bias, kept for when has_ids && ncols_dst == 1
+    // is routed here (see deep_mmvq_pipeline.md §5).
+    const uint32_t channel_bias = ids ? channel_x : channel_dst;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int n_full  = blocks_per_row_x / bpi;
+    const int rem     = blocks_per_row_x % bpi;
+    const uint32_t ntiles = (nrows_x + nwarps - 1) / nwarps;
+
+    // Dynamic shared memory, sized by the host at launch to fit the chosen `stages`
+    // and fusion state. __align__(16) is required for the mmvq_i32x4 staging stores;
+    // it holds because sizeof(block_q4_K) == 144 is itself a multiple of 16.
+    extern __shared__ __align__(16) char mmvq_rdna4_smem[];
+    block_q4_K (*x_stage)[n_groups]    = (block_q4_K (*)[n_groups]) mmvq_rdna4_smem;
+    block_q4_K (*gate_stage)[n_groups] = x_stage + stages; // only touched when fused
+
+    const bool fused = has_fusion && use_gate;
+
+    for (uint32_t t = blockIdx.x; t < ntiles; t += gridDim.x) {
+        const uint32_t row_real = t*nwarps + w;
+        const uint32_t row      = min(row_real, nrows_x - 1); // clamp for loads, never predicate them
+        const int kbx_offset    = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
+
+        float x_bias_val    = 0.0f;
+        float gate_bias_val = 0.0f;
+        if constexpr (has_fusion) {
+            // Lane 0 is the only lane that stores the final result, so it is the only
+            // one that needs these values; loading them here (once per row, off the
+            // hot path) hides the latency behind the staging pipeline below.
+            if (threadIdx.x == 0) {
+                if (x_bias) {
+                    x_bias_val = x_bias[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+                }
+                if (use_gate && gate_bias) {
+                    gate_bias_val = gate_bias[sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row];
+                }
+            }
+        }
+
+        float acc      = 0.0f;
+        float acc_gate = 0.0f;
+
+        // Issue this group's 128-bit load for the block owned on iteration it_load.
+        // The block index is CLAMPED, never predicated: this keeps the whole load
+        // path in one basic block with descending counted s_wait_loadcnt instead of
+        // the repeated full s_wait_loadcnt 0x0 drains that an exec-masked branch here
+        // would cause -- see deep_mmvq_pipeline.md §3.2 / COOP3_Analysis.txt §2. The
+        // redundant tail reads this produces are harmless because the buffer is
+        // simply never consumed out of range (the peeled tail below predicates the
+        // *consumer*, not the load).
+        auto load_quad = [&](const void * base, int it_load) -> mmvq_i32x4 {
+            const int kbx_ld = min(it_load*bpi + gl, blocks_per_row_x - 1);
+            const block_q4_K * b = (const block_q4_K *) base + (kbx_offset + kbx_ld);
+            return reinterpret_cast<const mmvq_i32x4 *>(b)[min(l, b128_per_block - 1)];
+        };
+
+        // Prologue: fill buffers for iterations 0 .. stages-2. By construction each
+        // iteration j (whether staged here or by the steady-state store below) always
+        // lands in buffer j % stages.
+#pragma unroll
+        for (int s = 0; s < stages - 1; ++s) {
+            const mmvq_i32x4 q = load_quad(vx, s);
+            if (loader) {
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[s][g])[l] = q;
+            }
+            if (fused) {
+                const mmvq_i32x4 gq = load_quad(vgate, s);
+                if (loader) {
+                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[s][g])[l] = gq;
+                }
+            }
+        }
+
+        // Steady-state, branch-free body: no have_next test and no kbx <
+        // blocks_per_row_x test anywhere (peeling below handles the true tail).
+        for (int it = 0; it < n_full; ++it) {
+            const int buf    = it % stages;
+            const int ld_it  = it + stages - 1;
+            const int st_buf = ld_it % stages;
+
+            // 1. issue the global loads for iteration it+stages-1 first, so they
+            //    overlap the wait and the dot product below.
+            const mmvq_i32x4 q_next  = load_quad(vx, ld_it);
+            const mmvq_i32x4 gq_next = fused ? load_quad(vgate, ld_it) : mmvq_i32x4_zero();
+
+            // 2. Wave-scoped LDS ordering, not a workgroup barrier: groups are wave-
+            //    contained (static_assert above), so this wave is the sole producer
+            //    and consumer of x_stage[*][g] and needs no cross-wave rendezvous.
+            mmvq_rdna4_lds_wait();
+
+            // 3. consume buffer it % stages
+            const int kby = (it*bpi + gl) * (qk/QK8_1);
+            acc += vec_dot_q4_K_q8_1_lds(&x_stage[buf][g], &y[kby], kqs);
+            if (fused) {
+                acc_gate += vec_dot_q4_K_q8_1_lds(&gate_stage[buf][g], &y[kby], kqs);
+            }
+
+            // 4. THEN land the prefetched quads into buffer (it+stages-1) % stages.
+            //    Safe without a second fence: this wave's own dot above already
+            //    consumed that buffer's previous occupant (iteration ld_it - stages),
+            //    so the write-after-read is satisfied by program order.
+            if (loader) {
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[st_buf][g])[l] = q_next;
+                if (fused) {
+                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[st_buf][g])[l] = gq_next;
+                }
+            }
+        }
+
+        // Peeled tail: blocks_per_row_x need not be a multiple of bpi. The tail
+        // iteration's data was already staged by the prologue or the main loop above
+        // (it is iteration n_full, which always lands in buffer n_full % stages by the
+        // same invariant); no new loads are issued here. An explicit wait is used
+        // unconditionally rather than relying on the main loop's last wait to have
+        // already drained it, because for stages == 2 the store for iteration n_full
+        // happens in the main loop's very last pass with no subsequent wait to cover
+        // it. Only the *consumer* is predicated (gl < rem): lanes gl >= rem hold a
+        // clamped duplicate of the last real block and must not be added in.
+        if (rem != 0) {
+            const int buf = n_full % stages;
+            mmvq_rdna4_lds_wait();
+            if (gl < rem) {
+                const int kby = (n_full*bpi + gl) * (qk/QK8_1);
+                acc += vec_dot_q4_K_q8_1_lds(&x_stage[buf][g], &y[kby], kqs);
+                if (fused) {
+                    acc_gate += vec_dot_q4_K_q8_1_lds(&gate_stage[buf][g], &y[kby], kqs);
+                }
+            }
+        }
+
+        acc = warp_reduce_sum<warp_size>(acc);
+        if (fused) {
+            acc_gate = warp_reduce_sum<warp_size>(acc_gate);
+        }
+        if (threadIdx.x == 0 && row_real < nrows_x) {
+            dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row_real] =
+                mmvq_apply_fusion(acc, acc_gate, x_bias_val, gate_bias_val, use_gate, active_glu, glu_limit);
+        }
+    }
+
+    GGML_UNUSED_VARS(stride_col_dst, ids_stride);
+    if constexpr (!has_fusion) {
+        GGML_UNUSED_VARS(x_bias, gate_bias, channel_bias);
+    }
+}
+
+#endif // defined(RDNA4)
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
