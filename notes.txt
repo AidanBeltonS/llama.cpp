@@ -83,4 +83,7 @@ To get a breakdown of the samples you can use the file below with. The python is
 
 python3 att_stall_breakdown.py ./db_att/stats_ui_output_agent_34489_dispatch_66.csv
 
-
+GGML_CUDA_DISABLE_GRAPHS=1 ./build/bin/test-backend-ops perf     -o MUL_MAT,MUL_MAT_VEC_FUSION     -p "(type=q._K,glu_op=2,m=1,n=17408,k=5120|type_a=q._K,type_b=f32,m=(5120,n=1,k=17408|10240,n=1,k=5120|1024,n=1,k=5120|12288,n=1,
+  k=5120|6144,n=1,k=5120|5120,n=1,k=6144|48,n=1,k=5120|248320,n=1,k=5120))"     2>/dev/null | tr -d '\r' | grep "runs -"     | sed -E 's/,bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1,src_overlap=0//;
+              s/,use_id=0,n_mats=1,n_used=1,b=0,with_bias=0,with_gate=1,with_lane_scale=0,batch_dims=\[1,1\]//;
+              s/\x1b\[[0-9;]*m//g; s/ +/ /g'
