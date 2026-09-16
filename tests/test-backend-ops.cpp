@@ -10825,6 +10825,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Correctness coverage for mul_mat_vec_q_rdna4 (ggml-cuda/mmvq.cu, deep_mmvq_pipeline.md
+    // §5/§5.1). This kernel only dispatches on RDNA4 (table_id == MMVQ_PARAMETERS_RDNA4), so on
+    // other backends/architectures these shapes simply exercise the existing mul_mat_vec_q path
+    // -- do not delete them as "redundant" just because they pass everywhere; they are the
+    // reference cases the RDNA4-gated kernel is checked against once that guard is relaxed.
+    // Shapes below hit, in order: (1) the peeled-tail iteration, where blocks_per_row_x =
+    // k/256 leaves a remainder mod bpi (bpi = warp_size/16: 2 on wave32, 4 on wave64) --
+    // k=5376 -> 21 blocks (odd: tail on both wave32 and wave64), k=5632 -> 22 blocks (even:
+    // no tail on wave32, 22%4=2: tail on wave64), k=5120 -> 20 blocks (no tail, control);
+    // (2) the row tail, where nrows_x % nwarps(=8) != 0 clamps the last wave's row for loads
+    // and predicates off its store (m=17412 = 17408+4, and m=17407, one below a multiple of 8);
+    // (3) the stage_y=false path, where y (ncols_x/32 * 36 B) no longer fits LDS alongside the
+    // staging buffers but the persistent row-per-wave loop still runs (m=5120, k=17408, the
+    // model's ffn_down); (4) the min-work fallback, where ntiles = ceil(nrows_x/8) is too small
+    // relative to the persistent grid target and the dispatch declines in favor of
+    // mul_mat_vec_q (m=1024, k=5120, the model's attn_k/attn_v -- declines) versus a shape
+    // just above that boundary (m=4096, k=5120 -- takes the persistent path). Both fused
+    // (SwiGLU, which changes the LDS partition: y_lds sits at x_stage + 2*stages instead of
+    // + stages) and unfused variants are included for the representative shapes.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1})); // no tail (control)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1,  5376, {1, 1}, {1, 1})); // tail on wave32 and wave64
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1,  5632, {1, 1}, {1, 1})); // tail on wave64 only
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17412, 1,  5120, {1, 1}, {1, 1})); // row tail (17408+4)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17407, 1,  5120, {1, 1}, {1, 1})); // row tail (one below a mult of 8)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5120, 1, 17408, {1, 1}, {1, 1})); // stage_y=false (ffn_down)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  1024, 1,  5120, {1, 1}, {1, 1})); // below min-work boundary (falls back)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  4096, 1,  5120, {1, 1}, {1, 1})); // at/above min-work boundary
+
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 17408,  5376,
+        false, 1, 1, false, false, true, false, {1, 1})); // fused, tail on wave32 and wave64
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 17408,  5632,
+        false, 1, 1, false, false, true, false, {1, 1})); // fused, tail on wave64 only
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1, 17412,  5120,
+        false, 1, 1, false, false, true, false, {1, 1})); // fused, row tail
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 1,  5120, 17408,
+        false, 1, 1, false, false, true, false, {1, 1})); // fused, stage_y=false
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
