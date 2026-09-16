@@ -1018,22 +1018,28 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
-#if defined(RDNA4)
+// NOTE: this block is guarded on GGML_USE_HIP, not on RDNA4. RDNA4 derives from
+// __GFX12__, which only exists in device compilation passes, so an #if defined(RDNA4)
+// here would hide the kernel from the host pass and the launch could not name it.
+// (mul_mat_vec_q has the same constraint, which is why its RDNA4 guard sits *inside*
+// the kernel body.) The kernel is only ever dispatched on RDNA4; the runtime table_id
+// check in mul_mat_vec_q_switch_ncols_dst is what enforces that.
+#if defined(GGML_USE_HIP)
 // Wave-scoped LDS ordering for the staging pipeline below. On RDNA4 this is a bare
 // dscnt wait: unlike __threadfence_block() it does not also drain loadcnt or issue a
 // global_inv, either of which would sink the in-flight 128-bit weight prefetch and
 // expose its latency instead of overlapping it with the dot product.
 //
-// s_wait_dscnt has no CDNA/GCN encoding, so those targets fall back to a full block
-// fence. That path exists purely so widening the guard on the kernel below to
-// `defined(RDNA4) || defined(CDNA)` -- the way RDNA4 code is correctness-tested on the
-// gfx942 dev box -- compiles and runs. The test is written positively (on CDNA/GCN)
-// rather than as a nested RDNA4 check so that widening the guard cannot disable it.
+// s_wait_dscnt is a gfx12 encoding, so every other AMD target falls back to a full
+// block fence. Those builds never dispatch this kernel, but the fallback keeps them
+// compiling -- and it is what lets the kernel be correctness-tested on the gfx942 dev
+// box by relaxing the runtime table_id check alone, with no preprocessor surgery.
+// gfx942 is wave64, so that run also exercises bpi = 4.
 static __device__ __forceinline__ void mmvq_rdna4_lds_wait() {
-#if defined(CDNA) || defined(GCN)
-    __threadfence_block();
-#else
+#if defined(RDNA4)
     asm volatile("s_wait_dscnt 0" ::: "memory");
+#else
+    __threadfence_block();
 #endif
 }
 
@@ -1306,7 +1312,148 @@ static __global__ void mul_mat_vec_q_rdna4(
     }
 }
 
-#endif // defined(RDNA4)
+// ---------------------------------------------------------------------------------------------
+// Host dispatch for mul_mat_vec_q_rdna4 above. See deep_mmvq_pipeline.md §5.
+
+// Persistent workgroups targeted per SM; swept in {1,2,4} on RDNA4 hardware (design doc Gate 3).
+static constexpr int MMVQ_RDNA4_PERSIST_MULT = 4;
+
+// LDS budget per workgroup that keeps 4 WG/CU resident at 8 waves/WG -- the RDNA4 wave-occupancy
+// limit of 32 waves/CU. See deep_mmvq_pipeline.md §4.
+static constexpr int MMVQ_RDNA4_LDS_BUDGET = 16384;
+
+template <bool has_fusion, int stages, bool stage_y>
+static void mul_mat_vec_q_rdna4_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride, const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_rdna4<has_fusion, stages, stage_y>, launch_params,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+}
+
+// stages is only ever {2,3,4} and stage_y is a bool; both must be compile-time for the kernel
+// template, so tag-dispatch the runtime choice made by mul_mat_vec_q_rdna4_try_launch below.
+template <bool has_fusion>
+static void mul_mat_vec_q_rdna4_dispatch(
+        const int stages, const bool stage_y,
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride, const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared, cudaStream_t stream) {
+#define MMVQ_RDNA4_LAUNCH(S, SY)                                                                                        \
+    mul_mat_vec_q_rdna4_launch<has_fusion, S, SY>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, \
+        stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,            \
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,          \
+        nbytes_shared, stream)
+
+    switch (stages) {
+        case 2: if (stage_y) { MMVQ_RDNA4_LAUNCH(2, true); } else { MMVQ_RDNA4_LAUNCH(2, false); } break;
+        case 3: if (stage_y) { MMVQ_RDNA4_LAUNCH(3, true); } else { MMVQ_RDNA4_LAUNCH(3, false); } break;
+        case 4: if (stage_y) { MMVQ_RDNA4_LAUNCH(4, true); } else { MMVQ_RDNA4_LAUNCH(4, false); } break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+#undef MMVQ_RDNA4_LAUNCH
+}
+
+// Gate + grid sizing + LDS-fit decision for the persistent RDNA4 Q4_K path
+// (deep_mmvq_pipeline.md §5). Returns true if it launched the kernel; false if the caller must
+// fall through to the existing per-lane / staged mul_mat_vec_q dispatch (which needs no special
+// handling -- it makes its own staged/per-lane decision independently).
+static bool mul_mat_vec_q_rdna4_try_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride, const int ncols_dst, const int nchannels_dst, const int nsamples_dst,
+        const int warp_size, const mmvq_parameter_table_id table_id, const int device, cudaStream_t stream) {
+    if (table_id != MMVQ_PARAMETERS_RDNA4 || ncols_dst != 1) {
+        return false;
+    }
+
+    constexpr int nwarps = 8; // must match mul_mat_vec_q_rdna4's constexpr nwarps
+    const int n_groups   = nwarps * warp_size / 16; // lanes_per_block = qi/vdr = 16 for Q4_K
+
+    const uint32_t ntiles = (nrows_x + nwarps - 1) / nwarps;
+
+    // nsm is already cached at init (ggml-cuda.cu:308-321); no additional static needed.
+    const int nsm    = ggml_cuda_info().devices[device].nsm;
+    const int target = MMVQ_RDNA4_PERSIST_MULT * nsm;
+    const int denom  = std::max(1, nchannels_dst * nsamples_dst);
+    uint32_t   grid_x = (uint32_t) std::max(1, (target + denom - 1) / denom); // ceil(target/denom)
+    grid_x = std::min(grid_x, ntiles);
+
+    if (ntiles < 2*grid_x) {
+        return false;
+    }
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    // Must match the kernel's `const bool fused = has_fusion && use_gate;` exactly -- y_lds's
+    // base offset is x_stage + (fused ? 2*stages : stages), so getting this wrong corrupts the
+    // staging buffers silently instead of crashing. NOTE: this is the gate-specific test, not
+    // the "any fusion arg" test used for the has_fusion template parameter above.
+    const bool fused_rt = has_fusion && fusion.gate != nullptr;
+
+    const int per_stage = n_groups * (int) sizeof(block_q4_K) * (fused_rt ? 2 : 1);
+    if (per_stage * 2 > MMVQ_RDNA4_LDS_BUDGET) {
+        return false; // not even the shallowest pipeline (stages=2, no y) fits
+    }
+    const int y_bytes = (int) (ncols_x / QK8_1) * (int) sizeof(block_q8_1);
+
+    const bool fits_stage_y_at_2 = per_stage*2 + y_bytes <= MMVQ_RDNA4_LDS_BUDGET;
+
+    // Read once into a function-local static, matching the style of other GGML_CUDA_* env
+    // lookups in this backend (e.g. GGML_CUDA_PDL in common.cuh, GGML_CUDA_DISABLE_FUSION in
+    // ggml-cuda.cu). -1 = unset (auto), 0 = force off, 1 = force on (but only if it fits).
+    static const int env_stage_y = []() -> int {
+        const char * env = getenv("GGML_CUDA_MMVQ_RDNA4_STAGE_Y");
+        if (!env) {
+            return -1;
+        }
+        return std::atoi(env) != 0 ? 1 : 0;
+    }();
+
+    // 0 forces off; unset and 1 both mean "on iff it fits" -- forcing on never violates the budget.
+    const bool stage_y = (env_stage_y != 0) && fits_stage_y_at_2;
+
+    const int y_component = stage_y ? y_bytes : 0;
+    int stages = 2;
+    for (int s = 4; s >= 2; --s) {
+        if (per_stage*s + y_component <= MMVQ_RDNA4_LDS_BUDGET) {
+            stages = s;
+            break;
+        }
+    }
+    const int nbytes_shared = per_stage*stages + y_component;
+
+    const dim3 block_nums(grid_x, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(warp_size, nwarps, 1);
+
+    if (has_fusion) {
+        mul_mat_vec_q_rdna4_dispatch<true>(stages, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,
+            nbytes_shared, stream);
+    } else {
+        mul_mat_vec_q_rdna4_dispatch<false>(stages, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,
+            nbytes_shared, stream);
+    }
+    return true;
+}
+
+#endif // defined(GGML_USE_HIP)
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
@@ -1640,6 +1787,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 1: {
             // static, else MSVC lambda capture breaks the constexpr uses below
             static constexpr int c_ncols_dst = 1;
+
+#if defined(GGML_USE_HIP)
+            // Persistent, row-per-wave Q4_K path for RDNA4 (deep_mmvq_pipeline.md §5), taken
+            // before the small_k/halve_iters decisions below -- those target the existing
+            // staged/per-lane kernel and do not apply to this one.
+            if constexpr (type == GGML_TYPE_Q4_K) {
+                if (mul_mat_vec_q_rdna4_try_launch(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_col_y,
+                        stride_col_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride,
+                        ncols_dst, nchannels_dst, nsamples_dst, warp_size, table_id, device, stream)) {
+                    break;
+                }
+            }
+#endif // defined(GGML_USE_HIP)
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
             const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
