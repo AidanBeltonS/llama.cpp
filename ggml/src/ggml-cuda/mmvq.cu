@@ -1043,14 +1043,19 @@ static __device__ __forceinline__ void mmvq_rdna4_lds_wait() {
 // across waves through LDS with a __syncthreads(); at rows_per_cuda_block == 1 that
 // pays a large prologue/epilogue once per row. This kernel instead gives each wave
 // its OWN output row and makes the workgroup persistent: it strides through tiles of
-// nwarps rows. There is no cross-wave reduction, no tmp_shared, and no
-// __syncthreads() anywhere below. See deep_mmvq_pipeline.md for the full design.
+// nwarps rows. There is no cross-wave reduction and no tmp_shared. The only
+// __syncthreads() below is the one-time `stage_y` copy before the persistent loop:
+// every wave reads *all* of `y` (it is loop-invariant across the whole persistent
+// loop, see deep_mmvq_pipeline.md §2.3), so staging it is genuine cross-wave sharing
+// and needs a real workgroup barrier, unlike `x_stage`/`gate_stage` where each group
+// is wave-contained and the wave-scoped mmvq_rdna4_lds_wait() suffices. See
+// deep_mmvq_pipeline.md for the full design.
 //
 // This is a genuine fork of mul_mat_vec_q (not a template specialization): it shares
 // the staging *idea* with the use_lds_stage block above, but the loop nest, the
 // buffer-index arithmetic, and the load/store predication are all different, so the
 // two are kept as independent code paths on purpose. Do not merge them.
-template <bool has_fusion, int stages>
+template <bool has_fusion, int stages, bool stage_y>
 __launch_bounds__(8*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_rdna4(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -1140,6 +1145,39 @@ static __global__ void mul_mat_vec_q_rdna4(
 
     const bool fused = has_fusion && use_gate;
 
+    // y_lds sits after the staging buffers. Its base depends on the RUNTIME `fused`
+    // flag because the host only allocates gate staging space when a gate is
+    // actually present; computed once here, outside the persistent loop, so this
+    // runtime-ness costs nothing in the hot path. sizeof(block_q4_K) == 144 is a
+    // multiple of 16, so this offset stays 16-aligned; block_q8_1 only needs 4-byte
+    // alignment, which b32 copies below respect.
+    block_q8_1 * y_lds = (block_q8_1 *) (x_stage + (fused ? 2*stages : stages));
+
+    if constexpr (stage_y) {
+        // y is loop-invariant across the whole persistent loop (see
+        // deep_mmvq_pipeline.md §2.3): it is indexed by k and by (channel, sample),
+        // never by row, and channel/sample are fixed for this workgroup. Stage it
+        // into LDS once, here, before the loop -- not per-iteration. block_q8_1 is
+        // only 4-byte aligned (36 B: 4 B ds + 32 B qs), so this is a b32 (dword)
+        // copy, not b128; it is paid once per workgroup against many tiles, so this
+        // is intentionally not over-engineered.
+        const int y_dwords     = blocks_per_row_x * (qk/QK8_1) * (int)(sizeof(block_q8_1)/4);
+        const int tid          = threadIdx.y*warp_size + threadIdx.x;
+        constexpr int nthreads = nwarps*warp_size;
+        for (int i = tid; i < y_dwords; i += nthreads) {
+            ((int *) y_lds)[i] = ((const int *) y)[i];
+        }
+        // Genuine cross-wave sharing: every wave reads all of y_lds, unlike
+        // x_stage/gate_stage where each group is wave-contained. This is the only
+        // __syncthreads() in the kernel, paid once per workgroup, not per iteration.
+        __syncthreads();
+    }
+
+    auto dot_y = [&](const block_q4_K * xb, int kby) -> float {
+        if constexpr (stage_y) { return vec_dot_q4_K_q8_1_lds(xb, &y_lds[kby], kqs); }
+        else                   { return vec_dot_q4_K_q8_1_lds(xb, &y[kby],     kqs); }
+    };
+
     for (uint32_t t = blockIdx.x; t < ntiles; t += gridDim.x) {
         const uint32_t row_real = t*nwarps + w;
         const uint32_t row      = min(row_real, nrows_x - 1); // clamp for loads, never predicate them
@@ -1214,9 +1252,9 @@ static __global__ void mul_mat_vec_q_rdna4(
 
             // 3. consume buffer it % stages
             const int kby = (it*bpi + gl) * (qk/QK8_1);
-            acc += vec_dot_q4_K_q8_1_lds(&x_stage[buf][g], &y[kby], kqs);
+            acc += dot_y(&x_stage[buf][g], kby);
             if (fused) {
-                acc_gate += vec_dot_q4_K_q8_1_lds(&gate_stage[buf][g], &y[kby], kqs);
+                acc_gate += dot_y(&gate_stage[buf][g], kby);
             }
 
             // 4. THEN land the prefetched quads into buffer (it+stages-1) % stages.
@@ -1245,9 +1283,9 @@ static __global__ void mul_mat_vec_q_rdna4(
             mmvq_rdna4_lds_wait();
             if (gl < rem) {
                 const int kby = (n_full*bpi + gl) * (qk/QK8_1);
-                acc += vec_dot_q4_K_q8_1_lds(&x_stage[buf][g], &y[kby], kqs);
+                acc += dot_y(&x_stage[buf][g], kby);
                 if (fused) {
-                    acc_gate += vec_dot_q4_K_q8_1_lds(&gate_stage[buf][g], &y[kby], kqs);
+                    acc_gate += dot_y(&gate_stage[buf][g], kby);
                 }
             }
         }
