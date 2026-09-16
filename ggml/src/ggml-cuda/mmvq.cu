@@ -590,6 +590,36 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// Applies the bias + GLU fusion epilogue to an already-scaled result/gate pair.
+// Callers are responsible for any type-specific scaling (e.g. NVFP4 x_scales/gate_scales)
+// before invoking this helper, since it must stay type-independent.
+static __device__ __forceinline__ float mmvq_apply_fusion(
+        float result, float gate_value, float x_bias, float gate_bias,
+        bool use_gate, ggml_glu_op active_glu, float glu_limit) {
+    result += x_bias;
+    if (use_gate) {
+        gate_value += gate_bias;
+        switch (active_glu) {
+            case GGML_GLU_OP_SWIGLU:
+                result *= ggml_cuda_op_silu_single(gate_value);
+                break;
+            case GGML_GLU_OP_GEGLU:
+                result *= ggml_cuda_op_gelu_single(gate_value);
+                break;
+            case GGML_GLU_OP_SWIGLU_OAI:
+                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                break;
+            case GGML_GLU_OP_SWIGLU_CLAMP:
+                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                break;
+            default:
+                result = result * gate_value;
+                break;
+        }
+    }
+    return result;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -966,31 +996,14 @@ static __global__ void mul_mat_vec_q(
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
                     }
-                    result += x_biases[j];
+                    float gate_value = 0.0f;
                     if (use_gate) {
-                        float gate_value = tmp_gate[j][i];
+                        gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
                         }
-                        gate_value += gate_biases[j];
-                        switch (active_glu) {
-                            case GGML_GLU_OP_SWIGLU:
-                                result *= ggml_cuda_op_silu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_GEGLU:
-                                result *= ggml_cuda_op_gelu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_OAI:
-                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_CLAMP:
-                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
-                                break;
-                            default:
-                                result = result * gate_value;
-                                break;
-                        }
                     }
+                    result = mmvq_apply_fusion(result, gate_value, x_biases[j], gate_biases[j], use_gate, active_glu, glu_limit);
                 }
                 dst[j*stride_col_dst + i] = result;
             }
