@@ -1061,7 +1061,7 @@ static __device__ __forceinline__ void mmvq_rdna4_lds_wait() {
 // the staging *idea* with the use_lds_stage block above, but the loop nest, the
 // buffer-index arithmetic, and the load/store predication are all different, so the
 // two are kept as independent code paths on purpose. Do not merge them.
-template <bool has_fusion, int stages, bool stage_y>
+template <bool has_fusion, int prefetch, bool stage_y>
 __launch_bounds__(8*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_rdna4(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -1142,12 +1142,17 @@ static __global__ void mul_mat_vec_q_rdna4(
     const int rem     = blocks_per_row_x % bpi;
     const uint32_t ntiles = (nrows_x + nwarps - 1) / nwarps;
 
-    // Dynamic shared memory, sized by the host at launch to fit the chosen `stages`
-    // and fusion state. __align__(16) is required for the mmvq_i32x4 staging stores;
+    // Dynamic shared memory, sized by the host at launch to fit the two staging
+    // buffers, the fusion state, and (when stage_y) the activations. __align__(16) is required for the mmvq_i32x4 staging stores;
     // it holds because sizeof(block_q4_K) == 144 is itself a multiple of 16.
     extern __shared__ __align__(16) char mmvq_rdna4_smem[];
+    // Exactly two LDS buffers: that is the minimum needed to keep the write-after-read
+    // between consecutive iterations safe, and more buys nothing. Prefetch distance is
+    // held in registers instead (see the shift register below), so LDS no longer scales
+    // with pipeline depth.
+    constexpr int n_buf = 2;
     block_q4_K (*x_stage)[n_groups]    = (block_q4_K (*)[n_groups]) mmvq_rdna4_smem;
-    block_q4_K (*gate_stage)[n_groups] = x_stage + stages; // only touched when fused
+    block_q4_K (*gate_stage)[n_groups] = x_stage + n_buf; // only touched when fused
 
     const bool fused = has_fusion && use_gate;
 
@@ -1157,7 +1162,7 @@ static __global__ void mul_mat_vec_q_rdna4(
     // runtime-ness costs nothing in the hot path. sizeof(block_q4_K) == 144 is a
     // multiple of 16, so this offset stays 16-aligned; block_q8_1 only needs 4-byte
     // alignment, which b32 copies below respect.
-    block_q8_1 * y_lds = (block_q8_1 *) (x_stage + (fused ? 2*stages : stages));
+    block_q8_1 * y_lds = (block_q8_1 *) (x_stage + (fused ? 2*n_buf : n_buf));
 
     if constexpr (stage_y) {
         // y is loop-invariant across the whole persistent loop (see
@@ -1222,19 +1227,35 @@ static __global__ void mul_mat_vec_q_rdna4(
             return reinterpret_cast<const mmvq_i32x4 *>(b)[min(l, b128_per_block - 1)];
         };
 
-        // Prologue: fill buffers for iterations 0 .. stages-2. By construction each
-        // iteration j (whether staged here or by the steady-state store below) always
-        // lands in buffer j % stages.
-#pragma unroll
-        for (int s = 0; s < stages - 1; ++s) {
-            const mmvq_i32x4 q = load_quad(vx, s);
+        // Prefetch registers. q[j] holds the quad loaded R+1-j iterations from being
+        // stored; q[R-1] is the oldest and is the one stored this iteration. A shift
+        // register is used rather than q[it % R] on purpose: a runtime index into a
+        // register array does not stay in registers, it spills to scratch. With R a
+        // compile-time constant the shift below is pure register renaming and costs
+        // nothing.
+        mmvq_i32x4 q[prefetch];
+        [[maybe_unused]] mmvq_i32x4 gq[prefetch];
+
+        // Prologue: LDS buffer 0 gets iteration 0; the registers are primed so that at
+        // the top of iteration 0, q[R-1] already holds iteration 1. Working backwards
+        // from "the store at iteration it writes iteration it+1", the load issued at
+        // iteration u is for iteration u+R+1, so q[j] starts out holding iteration R-j.
+        {
+            const mmvq_i32x4 q0 = load_quad(vx, 0);
             if (loader) {
-                reinterpret_cast<mmvq_i32x4 *>(&x_stage[s][g])[l] = q;
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[0][g])[l] = q0;
             }
             if (fused) {
-                const mmvq_i32x4 gq = load_quad(vgate, s);
+                const mmvq_i32x4 g0 = load_quad(vgate, 0);
                 if (loader) {
-                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[s][g])[l] = gq;
+                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[0][g])[l] = g0;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < prefetch; ++j) {
+                q[j] = load_quad(vx, prefetch - j);
+                if (fused) {
+                    gq[j] = load_quad(vgate, prefetch - j);
                 }
             }
         }
@@ -1242,50 +1263,59 @@ static __global__ void mul_mat_vec_q_rdna4(
         // Steady-state, branch-free body: no have_next test and no kbx <
         // blocks_per_row_x test anywhere (peeling below handles the true tail).
         for (int it = 0; it < n_full; ++it) {
-            const int buf    = it % stages;
-            const int ld_it  = it + stages - 1;
-            const int st_buf = ld_it % stages;
-
-            // 1. issue the global loads for iteration it+stages-1 first, so they
-            //    overlap the wait and the dot product below.
-            const mmvq_i32x4 q_next  = load_quad(vx, ld_it);
-            const mmvq_i32x4 gq_next = fused ? load_quad(vgate, ld_it) : mmvq_i32x4_zero();
-
-            // 2. Wave-scoped LDS ordering, not a workgroup barrier: groups are wave-
+            // 1. Wave-scoped LDS ordering, not a workgroup barrier: groups are wave-
             //    contained (static_assert above), so this wave is the sole producer
             //    and consumer of x_stage[*][g] and needs no cross-wave rendezvous.
             mmvq_rdna4_lds_wait();
 
-            // 3. consume buffer it % stages
+            // 2. consume buffer it & 1, written by the previous iteration.
             const int kby = (it*bpi + gl) * (qk/QK8_1);
-            acc += dot_y(&x_stage[buf][g], kby);
+            acc += dot_y(&x_stage[it & 1][g], kby);
             if (fused) {
-                acc_gate += dot_y(&gate_stage[buf][g], kby);
+                acc_gate += dot_y(&gate_stage[it & 1][g], kby);
             }
 
-            // 4. THEN land the prefetched quads into buffer (it+stages-1) % stages.
-            //    Safe without a second fence: this wave's own dot above already
-            //    consumed that buffer's previous occupant (iteration ld_it - stages),
-            //    so the write-after-read is satisfied by program order.
+            // 3. THEN land the OLDEST prefetched quad -- issued R iterations ago, so
+            //    it is the only one of the R outstanding loads that has to have
+            //    arrived. That is what turns the wait here into a counted
+            //    s_wait_loadcnt R-1 instead of a full 0x0 drain, and it is the whole
+            //    point of the shift register: loading and storing the same quad in one
+            //    iteration (the obvious formulation) leaves zero prefetch distance no
+            //    matter how many LDS buffers there are.
+            //    Safe without a second fence: buffer (it+1)&1 was last read by the dot
+            //    at iteration it-1, so the write-after-read is satisfied by order.
             if (loader) {
-                reinterpret_cast<mmvq_i32x4 *>(&x_stage[st_buf][g])[l] = q_next;
+                reinterpret_cast<mmvq_i32x4 *>(&x_stage[(it + 1) & 1][g])[l] = q[prefetch - 1];
                 if (fused) {
-                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[st_buf][g])[l] = gq_next;
+                    reinterpret_cast<mmvq_i32x4 *>(&gate_stage[(it + 1) & 1][g])[l] = gq[prefetch - 1];
                 }
+            }
+
+            // 4. rotate, then issue the newest load. Out-of-range indices are clamped
+            //    by load_quad, so no predicate is needed and the load stays in the
+            //    same basic block as its siblings.
+#pragma unroll
+            for (int r = prefetch - 1; r > 0; --r) {
+                q[r] = q[r-1];
+                if (fused) {
+                    gq[r] = gq[r-1];
+                }
+            }
+            q[0] = load_quad(vx, it + prefetch + 1);
+            if (fused) {
+                gq[0] = load_quad(vgate, it + prefetch + 1);
             }
         }
 
         // Peeled tail: blocks_per_row_x need not be a multiple of bpi. The tail
         // iteration's data was already staged by the prologue or the main loop above
-        // (it is iteration n_full, which always lands in buffer n_full % stages by the
-        // same invariant); no new loads are issued here. An explicit wait is used
-        // unconditionally rather than relying on the main loop's last wait to have
-        // already drained it, because for stages == 2 the store for iteration n_full
-        // happens in the main loop's very last pass with no subsequent wait to cover
-        // it. Only the *consumer* is predicated (gl < rem): lanes gl >= rem hold a
+        // (it is iteration n_full, which lands in buffer n_full & 1); no new loads are
+        // issued here. An explicit wait is used unconditionally rather than relying on
+        // the main loop's last wait, because the store for iteration n_full happens in
+        // that loop's very last pass with no subsequent wait to cover it. Only the *consumer* is predicated (gl < rem): lanes gl >= rem hold a
         // clamped duplicate of the last real block and must not be added in.
         if (rem != 0) {
-            const int buf = n_full % stages;
+            const int buf = n_full & 1;
             mmvq_rdna4_lds_wait();
             if (gl < rem) {
                 const int kby = (n_full*bpi + gl) * (qk/QK8_1);
@@ -1322,7 +1352,7 @@ static constexpr int MMVQ_RDNA4_PERSIST_MULT = 4;
 // limit of 32 waves/CU. See deep_mmvq_pipeline.md §4.
 static constexpr int MMVQ_RDNA4_LDS_BUDGET = 16384;
 
-template <bool has_fusion, int stages, bool stage_y>
+template <bool has_fusion, int prefetch, bool stage_y>
 static void mul_mat_vec_q_rdna4_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
@@ -1331,17 +1361,17 @@ static void mul_mat_vec_q_rdna4_launch(
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride, const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared, cudaStream_t stream) {
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_rdna4<has_fusion, stages, stage_y>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q_rdna4<has_fusion, prefetch, stage_y>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-// stages is only ever {2,3,4} and stage_y is a bool; both must be compile-time for the kernel
+// prefetch is only ever {2,3} and stage_y is a bool; both must be compile-time for the kernel
 // template, so tag-dispatch the runtime choice made by mul_mat_vec_q_rdna4_try_launch below.
 template <bool has_fusion>
 static void mul_mat_vec_q_rdna4_dispatch(
-        const int stages, const bool stage_y,
+        const int prefetch, const bool stage_y,
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
         const uint32_t stride_col_y, const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
@@ -1354,10 +1384,9 @@ static void mul_mat_vec_q_rdna4_dispatch(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,          \
         nbytes_shared, stream)
 
-    switch (stages) {
+    switch (prefetch) {
         case 2: if (stage_y) { MMVQ_RDNA4_LAUNCH(2, true); } else { MMVQ_RDNA4_LAUNCH(2, false); } break;
         case 3: if (stage_y) { MMVQ_RDNA4_LAUNCH(3, true); } else { MMVQ_RDNA4_LAUNCH(3, false); } break;
-        case 4: if (stage_y) { MMVQ_RDNA4_LAUNCH(4, true); } else { MMVQ_RDNA4_LAUNCH(4, false); } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -1399,18 +1428,19 @@ static bool mul_mat_vec_q_rdna4_try_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     // Must match the kernel's `const bool fused = has_fusion && use_gate;` exactly -- y_lds's
-    // base offset is x_stage + (fused ? 2*stages : stages), so getting this wrong corrupts the
+    // base offset is x_stage + (fused ? 2*n_buf : n_buf), so getting this wrong corrupts the
     // staging buffers silently instead of crashing. NOTE: this is the gate-specific test, not
     // the "any fusion arg" test used for the has_fusion template parameter above.
     const bool fused_rt = has_fusion && fusion.gate != nullptr;
 
-    const int per_stage = n_groups * (int) sizeof(block_q4_K) * (fused_rt ? 2 : 1);
-    if (per_stage * 2 > MMVQ_RDNA4_LDS_BUDGET) {
-        return false; // not even the shallowest pipeline (stages=2, no y) fits
+    // The kernel uses exactly two LDS buffers regardless of pipeline depth; prefetch
+    // distance lives in registers, not LDS. So the staging footprint is fixed and only
+    // the staged activations are variable.
+    const int lds_stage = 2 * n_groups * (int) sizeof(block_q4_K) * (fused_rt ? 2 : 1);
+    if (lds_stage > MMVQ_RDNA4_LDS_BUDGET) {
+        return false;
     }
     const int y_bytes = (int) (ncols_x / QK8_1) * (int) sizeof(block_q8_1);
-
-    const bool fits_stage_y_at_2 = per_stage*2 + y_bytes <= MMVQ_RDNA4_LDS_BUDGET;
 
     // Read once into a function-local static, matching the style of other GGML_CUDA_* env
     // lookups in this backend (e.g. GGML_CUDA_PDL in common.cuh, GGML_CUDA_DISABLE_FUSION in
@@ -1424,28 +1454,25 @@ static bool mul_mat_vec_q_rdna4_try_launch(
     }();
 
     // 0 forces off; unset and 1 both mean "on iff it fits" -- forcing on never violates the budget.
-    const bool stage_y = (env_stage_y != 0) && fits_stage_y_at_2;
+    const bool stage_y = (env_stage_y != 0) && (lds_stage + y_bytes <= MMVQ_RDNA4_LDS_BUDGET);
 
-    const int y_component = stage_y ? y_bytes : 0;
-    int stages = 2;
-    for (int s = 4; s >= 2; --s) {
-        if (per_stage*s + y_component <= MMVQ_RDNA4_LDS_BUDGET) {
-            stages = s;
-            break;
-        }
-    }
-    const int nbytes_shared = per_stage*stages + y_component;
+    // Pipeline depth is now bounded by registers, not LDS: each slot costs 4 VGPRs per
+    // staged tensor, on top of the ~48-68 the kernel already uses, against the ~96 that
+    // still allows 16 waves/SIMD in wave32. Fused stages two tensors, so it gets one
+    // slot fewer.
+    const int prefetch = fused_rt ? 2 : 3;
+    const int nbytes_shared = lds_stage + (stage_y ? y_bytes : 0);
 
     const dim3 block_nums(grid_x, nchannels_dst, nsamples_dst);
     const dim3 block_dims(warp_size, nwarps, 1);
 
     if (has_fusion) {
-        mul_mat_vec_q_rdna4_dispatch<true>(stages, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        mul_mat_vec_q_rdna4_dispatch<true>(prefetch, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,
             nbytes_shared, stream);
     } else {
-        mul_mat_vec_q_rdna4_dispatch<false>(stages, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        mul_mat_vec_q_rdna4_dispatch<false>(prefetch, stage_y, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums, block_dims,
             nbytes_shared, stream);
