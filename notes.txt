@@ -1,0 +1,86 @@
+Build in “Profiling Mode”
+
+-DGGML_HIP_EXPORT_METRICS=ON passes save temps to device compiler
+
+RelWithDebInfo applies -O2, and -g to collect symbols
+
+
+
+Configure:
+
+cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON -DGGML_HIP_EXPORT_METRICS=ON
+
+Build:
+cmake --build build --config RelWithDebInfo -- -j 16
+
+
+
+NOTE: The commands below ONLY run for prompt processing, update -p and -n appropriately to select prompts vs token profiling as needed. The commands below could also work for test-backend-ops but need some investigation
+
+Trace:
+
+rocprofv3 --sys-trace --output-format pftrace -d db_trace -o trace -- ./llama-bench -p 2048 -n 0 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+PC Sample:
+
+MMQ (Prompt Processing): 
+
+  # Q4_K main path (75% of mul_mat_q time)
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_q<\(ggml_type\)12, 128, false>' \
+    --kernel-iteration-range 337 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmq_q4k -o att \
+    -- ./llama-bench -p 512 -n 0 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+  # Q6_K path (22%)
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_q<\(ggml_type\)14, 128, false>' \
+    --kernel-iteration-range 65 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmq_q6k -o att \
+    -- ./llama-bench -p 512 -n 0 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+
+
+MMVQ (Token Generation):
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_vec_q<\(ggml_type\)12, 1, true, false, false>' \
+    --kernel-iteration-range 337 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmvq_q4k_fused -o att \
+    -- ./llama-bench -p 0 -n 128 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_vec_q<\(ggml_type\)12, 1, false, false, false>' \
+    --kernel-iteration-range 337 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmvq_q4k -o att \
+    -- ./llama-bench -p 0 -n 128 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_vec_q<\(ggml_type\)14, 1, true, false, false>' \
+    --kernel-iteration-range 337 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmvq_q6k_fused -o att \
+    -- ./llama-bench -p 0 -n 128 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+  rocprofv3 --att \
+    --kernel-include-regex 'mul_mat_vec_q<\(ggml_type\)14, 1, false, false, false>' \
+    --kernel-iteration-range 337 \
+    --att-shader-engine-mask 0xF \
+    --output-format csv -d db_att_mmvq_q6k -o att \
+    -- ./llama-bench -p 0 -n 128 -r 1 -ngl 24 -m /media/extra/llama-bench-models/Qwen3.8-27B-Q4_K_M.gguf
+
+kernel-iteration-range = the specific kernel that is profiled, 1 = first kernel ran which matches the regex. 65 = 65th version of the kernel that matches the regex
+
+kernel-iteration-rang=picks which hardware to instrument. 0xF means we collect results for 4 SIMD shader engines
+
+To get a breakdown of the samples you can use the file below with. The python is a WIP, ill update it through the challenge as we understand the issues more.
+
+python3 att_stall_breakdown.py ./db_att/stats_ui_output_agent_34489_dispatch_66.csv
+
+
