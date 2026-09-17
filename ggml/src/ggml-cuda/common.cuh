@@ -757,6 +757,18 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+// __byte_perm: selects 4 bytes out of {y, x}, one 3-bit index per nibble in the low 16 bits of s
+static __device__ __forceinline__ int ggml_cuda_byte_perm(const int x, const int y, const int s) {
+#if defined(GGML_USE_HIP)
+    // v_perm_b32 takes one selector byte per output byte instead, the ROCm __byte_perm is a byte table in scratch
+    const unsigned int su  = s;
+    const unsigned int sel = (su & 0x7) | ((su & 0x70) << 4) | ((su & 0x700) << 8) | ((su & 0x7000) << 12);
+    return (int) __builtin_amdgcn_perm((unsigned int) y, (unsigned int) x, sel);
+#else
+    return __byte_perm(x, y, s);
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }
