@@ -701,18 +701,18 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
 
         // unpack crumbs into nibble indices
-        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
-        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
+        const int n0 = ggml_cuda_byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
+        const int n1 = ggml_cuda_byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
         // unpack nibbles into byte values
-        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
-        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
-        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
-        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        const int s0 = ggml_cuda_byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = ggml_cuda_byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = ggml_cuda_byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = ggml_cuda_byte_perm(0x01FF, 0x01FF, n1 >> 16);
         // unshuffle values
-        const int v0 = __byte_perm(s0, s1, 0x5410);
-        const int v1 = __byte_perm(s0, s1, 0x7632);
-        const int v2 = __byte_perm(s2, s3, 0x5410);
-        const int v3 = __byte_perm(s2, s3, 0x7632);
+        const int v0 = ggml_cuda_byte_perm(s0, s1, 0x5410);
+        const int v1 = ggml_cuda_byte_perm(s0, s1, 0x7632);
+        const int v2 = ggml_cuda_byte_perm(s2, s3, 0x5410);
+        const int v3 = ggml_cuda_byte_perm(s2, s3, 0x7632);
 
         sumi = ggml_cuda_dp4a(v0, u0, sumi);
         sumi = ggml_cuda_dp4a(v1, u1, sumi);
@@ -755,11 +755,11 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
 #else
         // unpack even and odd crumbs into byte values
-        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
-        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qe = ggml_cuda_byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = ggml_cuda_byte_perm(0x020100FF, 0x020100FF, q >> 2);
         // unshuffle values
-        const int qx = __byte_perm(qe, qo, 0x5140);
-        const int qy = __byte_perm(qe, qo, 0x7362);
+        const int qx = ggml_cuda_byte_perm(qe, qo, 0x5140);
+        const int qy = ggml_cuda_byte_perm(qe, qo, 0x7362);
 #endif // defined(GGML_USE_HIP)
 
         sumi = ggml_cuda_dp4a(u, qx, sumi);
