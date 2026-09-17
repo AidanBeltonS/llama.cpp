@@ -696,11 +696,19 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    const int kbx0   = tid / (qi/vdr);
+    const int kqs    = vdr * (tid % (qi/vdr)); // x block quant index when casting the quants to int
+    const int n_iter = (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+    // uniform trip count: lanes past the end of the row load the last block with weight 0.
+    // A per-lane exit would make the loop exec-masked and drain the loads on every trip (AMD).
+#pragma unroll 2
+    for (int it = 0; it < n_iter; ++it) {
+        const int   kbx   = kbx0 + it*blocks_per_iter;
+        const bool  valid = kbx < blocks_per_row_x;
+        const int   kbx_c = valid ? kbx : blocks_per_row_x - 1;
+        const float w     = valid ? 1.0f : 0.0f;
+        const int   kby   = kbx_c * (qk/QK8_1); // y block index that aligns with kbx_c
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
         // start the next iterations' weight loads early
@@ -724,11 +732,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                tmp[j][i] += w * vec_dot_q_cuda(
+                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx_c, kqs);
                 if constexpr (has_gate) {
-                    tmp_gate[j][i] += vec_dot_q_cuda(
-                        vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    tmp_gate[j][i] += w * vec_dot_q_cuda(
+                        vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx_c, kqs);
                 }
             }
         }
@@ -891,15 +899,24 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    const int kbx0   = threadIdx.x / (qi/vdr);
+    const int kqs    = vdr * (threadIdx.x % (qi/vdr));
+    const int n_iter = (blocks_per_row_x + blocks_per_iter - 1) / blocks_per_iter;
+
+    // uniform trip count, see mul_mat_vec_q
+#pragma unroll 2
+    for (int it = 0; it < n_iter; ++it) {
+        const int   kbx   = kbx0 + it*blocks_per_iter;
+        const bool  valid = kbx < blocks_per_row_x;
+        const int   kbx_c = valid ? kbx : blocks_per_row_x - 1;
+        const float w     = valid ? 1.0f : 0.0f;
+        const int   kby   = kbx_c * (qk/QK8_1);
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += w * vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx_c, kqs);
             if constexpr (has_gate) {
-                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                tmp_gate[i] += w * vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx_c, kqs);
             }
         }
     }
