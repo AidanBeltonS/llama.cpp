@@ -31,7 +31,44 @@
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
+#if defined(__GFX8__) || defined(__GFX9__)
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+#else
+// RDNA: keep xor shuffles with a constant lane mask on the VALU, the HIP __shfl_xor is a ds_bpermute plus index arithmetic.
+// lane_mask < 16 stays inside a 16-lane DPP row, 16 swaps the two rows. All lanes must be active, as with a full CUDA mask.
+static __device__ __forceinline__ int ggml_hip_shfl_xor_i32(const int var, const int lane_mask, const int width) {
+    if (lane_mask < width) {
+        switch (lane_mask) {
+            case  1: return __builtin_amdgcn_mov_dpp(var, 0x161, 0xf, 0xf, true);
+            case  2: return __builtin_amdgcn_mov_dpp(var, 0x162, 0xf, 0xf, true);
+            case  4: return __builtin_amdgcn_mov_dpp(var, 0x164, 0xf, 0xf, true);
+            case  8: return __builtin_amdgcn_mov_dpp(var, 0x168, 0xf, 0xf, true);
+            case 16: return __builtin_amdgcn_permlanex16(var, var, 0x76543210, 0xfedcba98, true, false);
+            default: break;
+        }
+    }
+    return __shfl_xor(var, lane_mask, width);
+}
+static __device__ __forceinline__ int ggml_hip_shfl_xor(const int var, const int lane_mask, const int width) {
+    return ggml_hip_shfl_xor_i32(var, lane_mask, width);
+}
+static __device__ __forceinline__ unsigned int ggml_hip_shfl_xor(const unsigned int var, const int lane_mask, const int width) {
+    return (unsigned int) ggml_hip_shfl_xor_i32((int) var, lane_mask, width);
+}
+static __device__ __forceinline__ float ggml_hip_shfl_xor(const float var, const int lane_mask, const int width) {
+    return __int_as_float(ggml_hip_shfl_xor_i32(__float_as_int(var), lane_mask, width));
+}
+static __device__ __forceinline__ half2 ggml_hip_shfl_xor(const half2 var, const int lane_mask, const int width) {
+    const int tmp = ggml_hip_shfl_xor_i32(reinterpret_cast<const int &>(var), lane_mask, width);
+    return reinterpret_cast<const half2 &>(tmp);
+}
+// 64-bit and other types
+template <typename T>
+static __device__ __forceinline__ T ggml_hip_shfl_xor(const T var, const int lane_mask, const int width) {
+    return __shfl_xor(var, lane_mask, width);
+}
+#define __shfl_xor_sync(mask, var, laneMask, width) ggml_hip_shfl_xor(var, laneMask, width)
+#endif // defined(__GFX8__) || defined(__GFX9__)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
 #define cublasStrsmBatched hipblasStrsmBatched
