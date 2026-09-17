@@ -979,19 +979,29 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int ql0 = (ql >> 0) & 0x0F0F0F0F;
         const int ql1 = (ql >> 4) & 0x0F0F0F0F;
 
-        const int qh = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
-        const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
-        const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
+        const int qh  = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
+        const int qhs = qh >> ((txi & 0x08) >> 2);
+
+#if defined(GGML_USE_HIP)
+        // AMD has no byte-wise saturating subtract, so __vsubss4 expands to ~12 16-bit ops.
+        // The high 2 bits only ever select one of 4 values, so look them up already biased by -32.
+        // Table entries have a zero low nibble, so the low nibble is OR-ed in afterwards.
+        const int v0 = ql0 | (int) __builtin_amdgcn_perm(0, 0x1000F0E0, (qhs >> 0) & 0x03030303);
+        const int v1 = ql1 | (int) __builtin_amdgcn_perm(0, 0x1000F0E0, (qhs >> 4) & 0x03030303);
+#else
+        const int v0 = __vsubss4(ql0 | ((qhs << 4) & 0x30303030), 0x20202020);
+        const int v1 = __vsubss4(ql1 | ( qhs       & 0x30303030), 0x20202020);
+#endif // defined(GGML_USE_HIP)
 
         const int kq0 = 2*txi - txi % (QI6_K/2) + 0;
         const int kq1 = 2*txi - txi % (QI6_K/2) + QI6_K/2;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
-        x_qs[i*sram_stride + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+        x_qs[i*sram_stride + kq0] = v0;
+        x_qs[i*sram_stride + kq1] = v1;
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = v0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = v1;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 

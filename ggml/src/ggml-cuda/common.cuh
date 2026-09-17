@@ -1582,6 +1582,43 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // Consecutive dense matmuls often share src1: attn q/k/v read the same normed hidden
+    // state, ffn gate/up too. The quantized form of src1 depends only on src1 itself and on
+    // the scale layout, so the result of the previous quantization can be reused.
+    // Holds one buffer, which is enough because the matmuls that share src1 are adjacent.
+    //
+    // The buffer is allocated once and never moved, because a captured CUDA graph bakes in
+    // its address. A request that needs more room than the buffer has skips the cache
+    // instead of growing it. Skipping a quantize during capture is safe: the graph keeps the
+    // first matmul's quantize, so every replay refills the buffer before the others read it.
+    struct mmq_src1_cache {
+        ggml_cuda_pool *    pool   = nullptr;
+        char *              ptr    = nullptr;
+        size_t              size   = 0; // allocated size, as reported by the pool
+        const ggml_tensor * src1   = nullptr;
+        const void *        data   = nullptr;
+        int                 layout = -1;
+        size_t              nbytes = 0; // bytes the cached contents are valid for
+
+        // Keep the buffer, drop the contents. Called once per graph compute because src1 is
+        // refilled between them while tensor and buffer addresses stay the same.
+        void invalidate() {
+            src1 = nullptr; data = nullptr; layout = -1; nbytes = 0;
+        }
+
+        void release() {
+            if (ptr != nullptr) {
+                pool->free(ptr, size);
+                ptr = nullptr;
+            }
+            pool = nullptr; size = 0;
+            invalidate();
+        }
+    // mmq_src1 holds block_q8_1_mmq for the MMQ path, mmvq_src1 holds block_q8_1 for the
+    // MMVQ path. Separate entries because the two formats need different buffer sizes and
+    // the buffer is never grown once allocated.
+    } mmq_src1, mmvq_src1;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

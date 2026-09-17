@@ -702,6 +702,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    mmq_src1.release();
+    mmvq_src1.release();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -4460,6 +4463,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    // src1 contents change between graph computes while the tensor and buffer addresses stay
+    // the same, so the cached quantization must not survive into the next one.
+    cuda_ctx->mmq_src1.invalidate();
+    cuda_ctx->mmvq_src1.invalidate();
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

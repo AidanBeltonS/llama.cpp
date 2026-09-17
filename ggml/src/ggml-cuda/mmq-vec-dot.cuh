@@ -693,7 +693,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+    // Split the k01 range at the point where the min correction starts. The loop below cannot
+    // be unrolled (see the comment on the inner pragma), so without this split every test on
+    // k01 stays a runtime compare and costs a v_cndmask per accumulator element.
+    // With the split, min_pass is a compile time constant in both halves, and the whole
+    // sB term drops out of the second half because sB is zero there.
+    constexpr int k01_split = MMQ_TILE_NE_K * 3/4;
+
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool min_pass = pass != 0;
+        const int  k01_end  = min_pass ? MMQ_TILE_NE_K : k01_split;
+
+#if defined(AMD_WMMA_AVAILABLE)
+    // WMMA needs 8 VGPRs per tile_C, twice as many as MFMA. Unrolling this loop spills the accumulators.
+#pragma unroll 1
+#endif // defined(AMD_WMMA_AVAILABLE)
+    for (int k01 = min_pass ? k01_split : 0; k01 < k01_end; k01 += 4) {
         const int k0 = k00 + k01;
 
         tile_A A[ntx];
@@ -708,13 +724,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
-            const float dB = (k01 < MMQ_TILE_NE_K/2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K]).x : __half22float2(y_ds[j*MMQ_TILE_Y_K]).y;
-            const float sB = (k01 >= MMQ_TILE_NE_K * 3/4) ? 0
+            const float dB = (!min_pass && k01 < MMQ_TILE_NE_K/2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K]).x : __half22float2(y_ds[j*MMQ_TILE_Y_K]).y;
+            const float sB = min_pass ? 0
                                               : (((k01/4)%2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).y
                                                              : __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).x);
 
             tile_C Cm;
-            if (k01 >= MMQ_TILE_NE_K * 3/4) {
+            if (min_pass) {
                 tile_A A1;
 #pragma unroll
                 for (int l = 0; l < tile_A::ne; ++l) {
@@ -733,14 +749,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const float2 dm = __half22float2(x_dm[i*sram_stride + k0/4]);
                     float tmp = Cd.x[l]*dm.x;
-                    if (k01 >= MMQ_TILE_NE_K * 3/4) {
+                    if (min_pass) {
                         tmp -= Cm.x[l]*dm.y;
                     }
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += tmp*dB;
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] -= dm.y*sB;
+                    if (!min_pass) {
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] -= dm.y*sB;
+                    }
                 }
             }
         }
+    }
     }
 #elif defined(TURING_MMA_AVAILABLE)
 
@@ -1055,7 +1074,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * (sc[k01/4] * x_df[i*sram_stride] * dB);
                 }
             }
         }
